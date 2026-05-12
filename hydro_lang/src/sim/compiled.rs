@@ -49,7 +49,12 @@ impl StateFingerprint {
         for ((loc, cid), hook_list) in hooks {
             for (i, hook) in hook_list.iter().enumerate() {
                 if hook.is_fairness_subject() {
-                    (loc, cid, i, hook.pending_count()).hash(&mut pending_hasher);
+                    // Use "empty vs non-empty" rather than exact count to detect
+                    // cycles faster. From a fairness perspective, having 1 vs N
+                    // pending messages is the same abstract state (the hook is
+                    // enabled and can deliver). This prevents unbounded state
+                    // growth when messages accumulate in lossy buffers.
+                    (loc, cid, i, hook.pending_count().min(1)).hash(&mut pending_hasher);
                     (loc, cid, i, hook.can_make_nontrivial_decision()).hash(&mut enabled_hasher);
                 }
             }
@@ -241,6 +246,7 @@ pub struct CompiledSim {
     pub(super) lib: Library,
     pub(super) externals_port_registry: SimExternalPortRegistry,
     pub(super) unit_test_fuzz_iterations: usize,
+    pub(super) max_lasso_steps: usize,
 }
 
 #[sealed::sealed]
@@ -304,12 +310,14 @@ impl CompiledSim {
     ) -> T {
         let func: SimLoaded = unsafe { self.lib.get(b"__hydro_runtime").unwrap() };
         let log = always_log || std::env::var("HYDRO_SIM_LOG").is_ok_and(|v| v == "1");
+        let max_lasso_steps = self.max_lasso_steps;
         thunk(
             &(|| CompiledSimInstance {
                 func: func.clone(),
                 externals_port_registry: self.externals_port_registry.clone(),
                 dylib_result: None,
                 log,
+                max_lasso_steps,
             }),
         )
     }
@@ -540,6 +548,7 @@ pub struct CompiledSimInstance<'a> {
     externals_port_registry: SimExternalPortRegistry,
     dylib_result: Option<DylibResult>,
     log: bool,
+    max_lasso_steps: usize,
 }
 
 impl<'a> CompiledSimInstance<'a> {
@@ -701,6 +710,7 @@ impl<'a> CompiledSimInstance<'a> {
                 LogKind::Null
             },
             quiescence,
+            max_lasso_steps: self.max_lasso_steps,
         };
 
         async move { launched.scheduler().await }
@@ -1206,11 +1216,13 @@ struct LaunchedSim<W: std::io::Write> {
     log: LogKind<W>,
     /// Represents quiescence state of the simulation.
     quiescence: Rc<QuiescenceState>,
+    /// Maximum steps for the lasso detector before truncation.
+    max_lasso_steps: usize,
 }
 
 impl<W: std::io::Write> LaunchedSim<W> {
     async fn scheduler(&mut self) {
-        let mut lasso_detector = LassoDetector::new(200);
+        let mut lasso_detector = LassoDetector::new(self.max_lasso_steps);
         let mut force_delivery_targets: Vec<(LocationId, Option<u32>, usize)> = Vec::new();
 
         loop {
@@ -1370,7 +1382,7 @@ impl<W: std::io::Write> LaunchedSim<W> {
                             });
 
                             // Reset lasso detector after successful force delivery
-                            lasso_detector = LassoDetector::new(200);
+                            lasso_detector = LassoDetector::new(self.max_lasso_steps);
                             continue; // Go back to run async DFIRs
                         }
 
