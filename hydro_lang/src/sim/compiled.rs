@@ -1330,10 +1330,17 @@ impl<W: std::io::Write> LaunchedSim<W> {
                             .map(|(loc, cid, _)| (loc.clone(), *cid))
                             .collect();
 
-                        // Check in possibly_ready_observation (already passed readiness check)
-                        if let Some(forced_obs_idx) = self.possibly_ready_observation.iter().position(|(loc, cid)| {
+                        // Check if the forced observation has items to deliver
+                        let forced_obs_with_items = self.possibly_ready_observation.iter().position(|(loc, cid)| {
                             forced_keys.contains(&(loc.clone(), *cid))
-                        }) {
+                                && self.hooks
+                                    .get(&(loc.clone(), *cid))
+                                    .into_iter()
+                                    .flatten()
+                                    .any(|hook| hook.can_make_nontrivial_decision())
+                        });
+
+                        if let Some(forced_obs_idx) = forced_obs_with_items {
                             let obs_key = self.possibly_ready_observation[forced_obs_idx].clone();
 
                             let force_indices: Vec<usize> = force_delivery_targets
@@ -1366,6 +1373,112 @@ impl<W: std::io::Write> LaunchedSim<W> {
                             lasso_detector = LassoDetector::new(200);
                             continue; // Go back to run async DFIRs
                         }
+
+                        // Forced observation not ready yet — deterministically run
+                        // a tick to feed data to it. Skip any() branching to prune
+                        // unfair executions that would never resolve the forced target.
+                        if !self.possibly_ready_ticks.is_empty() {
+                            // Pick the first ready tick deterministically (no branching)
+                            let next_tick_or_obs = 0;
+
+                            let mut removed = self.possibly_ready_ticks.remove(next_tick_or_obs);
+
+                            // Force all fairness-subject hooks in this tick to fire
+                            let tick_key = (removed.0.clone(), removed.1);
+                            let hooks = self.hooks.get_mut(&tick_key).unwrap();
+                            let tick_force_indices: Vec<usize> = hooks
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, h)| h.is_fairness_subject())
+                                .map(|(i, _)| i)
+                                .collect();
+
+                            match &mut self.log {
+                                LogKind::Null => {}
+                                LogKind::Stderr => {
+                                    if let Some(cid) = &removed.1 {
+                                        eprintln!(
+                                            "\n{}",
+                                            format!("Running Tick (Cluster Member {}) [force-delivery mode]", cid)
+                                                .color(colored::Color::Magenta)
+                                                .bold()
+                                        )
+                                    } else {
+                                        eprintln!(
+                                            "\n{}",
+                                            "Running Tick [force-delivery mode]".color(colored::Color::Magenta).bold()
+                                        )
+                                    }
+                                }
+                                LogKind::Custom(writer) => {
+                                    writeln!(
+                                        writer,
+                                        "\n{}",
+                                        "Running Tick [force-delivery mode]".color(colored::Color::Magenta).bold()
+                                    )
+                                    .unwrap();
+                                }
+                            }
+
+                            let mut asterisk_indenter = |_line_no, write: &mut dyn std::fmt::Write| {
+                                write.write_str(&"*".color(colored::Color::Magenta).bold())?;
+                                write.write_str(" ")
+                            };
+
+                            let mut tick_decision_writer = indenter::indented(&mut self.log)
+                                .with_format(indenter::Format::Custom {
+                                    inserter: &mut asterisk_indenter,
+                                });
+
+                            let hooks = self.hooks.get_mut(&tick_key).unwrap();
+                            run_hooks_with_force(&mut tick_decision_writer, hooks, &tick_force_indices);
+
+                            // Record deliveries
+                            for (i, hook) in hooks.iter().enumerate() {
+                                if hook.is_fairness_subject() && hook.current_decision() == Some(true) {
+                                    lasso_detector.record_delivery(&removed.0, removed.1, i);
+                                }
+                            }
+
+                            let run_tick_future = removed.2.run_tick();
+                            if let Some(inline_hooks) =
+                                self.inline_hooks.get_mut(&(removed.0.clone(), removed.1))
+                            {
+                                let mut run_tick_future_pinned = pin!(run_tick_future);
+
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        r = &mut run_tick_future_pinned => {
+                                            assert!(r);
+                                            break;
+                                        }
+                                        _ = async {} => {
+                                            bolero_generator::any::scope::borrow_with(|driver| {
+                                                for hook in inline_hooks.iter_mut() {
+                                                    if hook.pending_decision() {
+                                                        if !hook.has_decision() {
+                                                            hook.autonomous_decision(driver);
+                                                        }
+
+                                                        hook.release_decision(&mut tick_decision_writer);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            } else {
+                                assert!(run_tick_future.await);
+                            }
+
+                            self.possibly_ready_ticks.push(removed);
+                            continue; // Go back to run async DFIRs to propagate data
+                        }
+
+                        // No ticks ready either — the forced observation may need
+                        // async DFIR progress. Continue the loop to let DFIRs run.
+                        continue;
                     }
 
                     let next_tick_or_obs = (0..(self.possibly_ready_ticks.len()

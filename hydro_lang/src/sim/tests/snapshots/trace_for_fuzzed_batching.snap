@@ -1,13 +1,15 @@
 ---
 source: hydro_lang/src/sim/tests/mod.rs
+assertion_line: 208
 expression: log_str
 ---
+
 Running Tick
-* --> src/sim/tests/mod.rs:105:10
+* --> src/sim/tests/mod.rs:106:10
 *  |        .batch(&tick, nondet!(/** test */))
 *  |         ^ releasing items: [456, 456, 456, 456, 456, 456, 456, 456, ..] (1000 total)
 
 Running Tick
-* --> src/sim/tests/mod.rs:105:10
+* --> src/sim/tests/mod.rs:106:10
 *  |        .batch(&tick, nondet!(/** test */))
 *  |         ^ releasing items: [100, 23]

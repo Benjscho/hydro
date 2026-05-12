@@ -159,15 +159,15 @@ Lasso detection now runs globally before each scheduling decision (not per-obser
 3. If some enabled hooks never delivered → unfair lasso → ForceDelivery
 4. If max_steps exceeded → Truncated
 
-### Task 5: Enable liveness tests ⚠️ PARTIALLY DONE
+### Task 5: Enable liveness tests ✅ DONE
 
 **File**: `hydro_lang/src/sim/tests/liveness.rs`
 
 - `liveness_single_send_over_lossy_fails` — runs and passes ✅
-- `liveness_sample_every_over_lossy` — `#[ignore]`, blocked on scheduler issue
-- `liveness_retry_with_ack` — `#[ignore]`, blocked on scheduler issue
+- `liveness_sample_every_over_lossy` — runs and passes ✅
+- `liveness_retry_with_ack` — runs and passes ✅
 
-### Task 6: `source_interval` in sim ⚠️ PARTIALLY DONE
+### Task 6: `source_interval` in sim ✅ DONE
 
 **Design**: See `design_docs/2025-01_sample_every_in_sim.md`
 
@@ -178,22 +178,15 @@ Sub-tasks:
 4. ✅ Sim builder: emit `IntervalHook` for `Interval` sources
 5. ✅ Add `is_interval` field to `StreamHook`, generalize `is_lossy()` → `is_fairness_subject()`
 6. ✅ Update lasso detector to use `is_fairness_subject()` instead of `is_lossy()`
-7. 🚫 Remove `#[ignore]` from liveness tests — **BLOCKED** on scheduler issue
+7. ✅ Remove `#[ignore]` from liveness tests
 
-### Blocker: Lossy hook observation never becomes ready
+### Resolved: Lossy hook observation scheduling
 
-The lossy network hook is registered as an **observation** for the receiver's location. The scheduler's observation readiness check filters out observations whose hooks have no pending items. The lossy hook's buffer only gets items AFTER the sender's tick fires, but the readiness check runs BEFORE ticks fire (in the same scheduler iteration).
+The blocker was that when `ForceDelivery` was active, the exhaustive explorer still branched via `any()`, exploring paths where the forced observation never got resolved (the sender's tick was picked instead, creating an infinite exploration loop).
 
-**Sequence**:
-1. Readiness check → lossy hook empty → receiver's observation filtered out
-2. Scheduler picks sender's tick → tick fires → bytes sent to network channel
-3. Loop restarts → receiver's async DFIR picks up bytes → feeds into lossy buffer
-4. Readiness check → lossy hook NOW has items → receiver's observation IS ready
-5. But the exhaustive explorer also explores the branch where the sender's tick is picked again (step 2), creating an infinite cycle
+**Fix**: When `ForceDelivery` is active but the forced observation's buffer is empty (data hasn't flowed from sender yet), skip `any()` branching and deterministically run ticks with all fairness-subject hooks forced to fire. This feeds data to the forced observation without exploring unfair branches. Once the forced observation has items, resolve it immediately with forced delivery.
 
-The lasso detector correctly identifies this as an unfair cycle and issues `ForceDelivery`. The force delivery mechanism keeps the targets persistent and resolves forced observations when they become ready. However, in the exhaustive exploration, there always exists a branch where the scheduler picks the sender's tick/observation instead of the forced receiver's observation, leading to the test failing.
-
-**Proposed fix**: Change the lossy hook from a standalone observation to part of the receiver's **tick** (similar to how batch hooks work). This would make the lossy hook resolve as part of the normal tick execution flow, eliminating the scheduling race. Alternatively, when `ForceDelivery` is active, prune all branches that don't resolve the forced observation (since those branches represent unfair executions that shouldn't be explored).
+This is semantically correct: unfair executions (where a continuously-enabled hook is starved) are not valid counterexamples to liveness properties, so pruning them doesn't affect completeness.
 
 ## Open Questions
 
