@@ -111,7 +111,7 @@ Termination guarantee:
 
 ## Task Breakdown
 
-### Task 1: Mark hooks as lossy
+### Task 1: Mark hooks as lossy ✅ DONE
 
 **File**: `hydro_lang/src/sim/runtime.rs`
 
@@ -122,15 +122,15 @@ fn is_lossy(&self) -> bool { false }
 
 No new hook struct needed. `StreamHook` already supports releasing 0 items (a "drop"). The lossy flag tells the scheduler to apply fairness constraints.
 
-### Task 2: Wire up lossy network in SimBuilder
+### Task 2: Wire up lossy network in SimBuilder ✅ DONE
 
 **File**: `hydro_lang/src/sim/builder.rs`
 
-Replace the `todo!()` at line 1205 with the same wiring as `FailStop` (unbounded channel + `StreamHook`), but mark the resulting hook as lossy. The hook is registered with `is_lossy() = true`.
+Replace the `todo!()` with the same wiring as `FailStop` (unbounded channel + `StreamHook`), but mark the resulting hook as lossy. All four topology cases (P→P, C→P, P→C, C→C) are handled.
 
-### Task 3: State fingerprinting infrastructure
+### Task 3: State fingerprinting infrastructure ✅ DONE
 
-**File**: `hydro_lang/src/sim/compiled.rs` (new struct, possibly in a new file)
+**File**: `hydro_lang/src/sim/compiled.rs`
 
 ```rust
 struct StateFingerprint { pending_counts: u64, enabled_hooks: u64 }
@@ -143,11 +143,11 @@ struct LassoDetector {
 
 struct FairnessRecord {
     /// For each lossy hook index: did it deliver ≥1 item since last fingerprint?
-    delivered: Vec<bool>,
+    delivered: HashMap<(LocationId, Option<u32>, usize), bool>,
 }
 ```
 
-### Task 4: Lasso detection in scheduler loop
+### Task 4: Lasso detection in scheduler loop ✅ DONE
 
 **File**: `hydro_lang/src/sim/compiled.rs`
 
@@ -159,15 +159,28 @@ After each round of hook resolution, if any lossy hook has pending items:
    - Fair + hot → declare quiescence (liveness violation found)
 4. If max_steps exceeded → declare quiescence (truncate)
 
-### Task 5: Enable liveness tests
+### Task 5: Enable liveness tests ⚠️ PARTIALLY DONE
 
 **File**: `hydro_lang/src/sim/tests/liveness.rs`
 
-Remove `#[ignore]` annotations from the three test functions.
+- `liveness_single_send_over_lossy_fails` — runs and passes ✅
+- `liveness_sample_every_over_lossy` — `#[ignore]`, blocked on Task 6
+- `liveness_retry_with_ack` — `#[ignore]`, blocked on Task 6
 
-### Task 6: `source_interval` in sim (prerequisite check)
+### Task 6: `source_interval` in sim 🔲 NOT STARTED
 
-Verify that `sample_every` / `source_interval` actually produces messages in the simulator. If it uses `tokio::time::interval`, ensure the sim runtime advances virtual time. If not working, this is a prerequisite blocker.
+**Design**: See `design_docs/2025-01_sample_every_in_sim.md`
+
+`source_interval` uses `tokio::time::interval` which requires the time driver. The simulator doesn't enable it. The solution is to replace `source_interval` with a non-deterministic self-replenishing hook in the sim (Layer 2: relative time), subject to lasso-based weak fairness.
+
+Sub-tasks:
+1. Add `HydroSource::Interval(DebugExpr)` to the IR
+2. Update `Location::source_interval` to emit it
+3. Update deploy builder to lower `Interval` to `IntervalStream` (preserves existing behavior)
+4. Sim builder: emit self-replenishing `StreamHook` for `Interval` sources
+5. Add `is_interval` field to `StreamHook`, generalize `is_lossy()` → `is_fairness_subject()`
+6. Update lasso detector to use `is_fairness_subject()` instead of `is_lossy()`
+7. Remove `#[ignore]` from liveness tests
 
 ## Open Questions
 
@@ -175,6 +188,4 @@ Verify that `sample_every` / `source_interval` actually produces messages in the
 
 2. **Fingerprint precision**: Start with pending-count-only. Add message-content hashing only if false positives appear in practice.
 
-3. **`source_interval` in sim**: Does virtual time advance correctly? If not, Task 6 becomes a prerequisite implementation task.
-
-4. **Interaction with exhaustive search**: Forced delivery prunes unfair executions. This is semantically correct (unfair executions aren't valid counterexamples) and doesn't affect completeness.
+3. **Interaction with exhaustive search**: Forced delivery prunes unfair executions. This is semantically correct (unfair executions aren't valid counterexamples) and doesn't affect completeness.
