@@ -30,6 +30,148 @@ use crate::location::dynamic::LocationId;
 use crate::sim::graph::{SimExternalPort, SimExternalPortRegistry};
 use crate::sim::runtime::SimHook;
 
+/// State fingerprint for lasso detection. Captures the pending message counts
+/// and which lossy hooks are enabled (can make nontrivial decisions).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct StateFingerprint {
+    /// Hash of pending counts per lossy hook.
+    pending_counts: u64,
+    /// Hash of which lossy hooks can make nontrivial decisions.
+    enabled_hooks: u64,
+}
+
+impl StateFingerprint {
+    fn compute(hooks: &Hooks<LocationId>) -> Self {
+        use std::hash::Hash;
+        let mut pending_hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut enabled_hasher = std::collections::hash_map::DefaultHasher::new();
+
+        for ((loc, cid), hook_list) in hooks {
+            for (i, hook) in hook_list.iter().enumerate() {
+                if hook.is_lossy() {
+                    (loc, cid, i, hook.pending_count()).hash(&mut pending_hasher);
+                    (loc, cid, i, hook.can_make_nontrivial_decision()).hash(&mut enabled_hasher);
+                }
+            }
+        }
+
+        StateFingerprint {
+            pending_counts: std::hash::Hasher::finish(&pending_hasher),
+            enabled_hooks: std::hash::Hasher::finish(&enabled_hasher),
+        }
+    }
+}
+
+/// Tracks which lossy hooks have delivered at least one item during a cycle.
+struct FairnessRecord {
+    /// For each lossy hook (identified by index in the trace), whether it delivered ≥1 item.
+    delivered: HashMap<(LocationId, Option<u32>, usize), bool>,
+}
+
+/// Detects lasso (repeated state) patterns in the scheduler to enforce weak fairness
+/// on lossy network hooks.
+struct LassoDetector {
+    /// Trace of (fingerprint, fairness record) at each observation point.
+    trace: Vec<(StateFingerprint, FairnessRecord)>,
+    /// Maps fingerprints to positions in the trace where they occurred.
+    seen: HashMap<StateFingerprint, Vec<usize>>,
+    /// Maximum steps before truncation.
+    max_steps: usize,
+}
+
+enum LassoResult {
+    /// No lasso detected yet, continue normally.
+    Continue,
+    /// Unfair lasso: these lossy hooks were starved and should be forced to deliver.
+    ForceDelivery(Vec<(LocationId, Option<u32>, usize)>),
+    /// Fair hot lasso: genuine liveness violation, declare quiescence.
+    LivenessViolation,
+    /// Max steps exceeded, truncate.
+    Truncated,
+}
+
+impl LassoDetector {
+    fn new(max_steps: usize) -> Self {
+        Self {
+            trace: Vec::new(),
+            seen: HashMap::new(),
+            max_steps,
+        }
+    }
+
+    /// Record a step and check for lassos. Returns the action to take.
+    fn step(&mut self, hooks: &Hooks<LocationId>) -> LassoResult {
+        if self.trace.len() >= self.max_steps {
+            return LassoResult::Truncated;
+        }
+
+        let fingerprint = StateFingerprint::compute(hooks);
+
+        // Build fairness record: which lossy hooks have pending items?
+        let mut record = FairnessRecord {
+            delivered: HashMap::new(),
+        };
+        for ((loc, cid), hook_list) in hooks {
+            for (i, hook) in hook_list.iter().enumerate() {
+                if hook.is_lossy() && hook.can_make_nontrivial_decision() {
+                    record.delivered.insert((loc.clone(), *cid, i), false);
+                }
+            }
+        }
+
+        // Check if this fingerprint was seen before
+        if let Some(positions) = self.seen.get(&fingerprint) {
+            // Use the most recent occurrence for the shortest cycle
+            let &prev_pos = positions.last().unwrap();
+            // Check fairness of the cycle from prev_pos to now
+            let cycle = &self.trace[prev_pos..];
+            #[expect(clippy::disallowed_methods, reason = "HashMap keys iteration order doesn't matter here")]
+            let all_fair = record.delivered.keys().all(|key| {
+                cycle
+                    .iter()
+                    .any(|(_, fr)| fr.delivered.get(key).copied() == Some(true))
+            });
+
+            if all_fair {
+                // Fair lasso — liveness violation
+                return LassoResult::LivenessViolation;
+            } else {
+                // Unfair lasso — find starved hooks
+                #[expect(clippy::disallowed_methods, reason = "HashMap keys iteration order doesn't matter here")]
+                let starved: Vec<_> = record
+                    .delivered
+                    .keys()
+                    .filter(|key| {
+                        !cycle
+                            .iter()
+                            .any(|(_, fr)| fr.delivered.get(key).copied() == Some(true))
+                    })
+                    .cloned()
+                    .collect();
+                return LassoResult::ForceDelivery(starved);
+            }
+        }
+
+        let pos = self.trace.len();
+        self.seen
+            .entry(fingerprint.clone())
+            .or_default()
+            .push(pos);
+        self.trace.push((fingerprint, record));
+
+        LassoResult::Continue
+    }
+
+    /// Mark that a lossy hook delivered items in the current step.
+    fn record_delivery(&mut self, loc: &LocationId, cid: Option<u32>, hook_idx: usize) {
+        if let Some((_, record)) = self.trace.last_mut()
+            && let Some(delivered) = record.delivered.get_mut(&(loc.clone(), cid, hook_idx))
+        {
+            *delivered = true;
+        }
+    }
+}
+
 struct QuiescenceState {
     /// Set to true when the scheduler reaches quiescence; reset to false when new input is sent.
     quiescent: Cell<bool>,
@@ -616,7 +758,7 @@ impl<T: Serialize + DeserializeOwned, O: Ordering, R: Retries> SimReceiver<T, O,
     }
 }
 
-impl<T: Serialize + DeserializeOwned> SimReceiver<T, TotalOrder, ExactlyOnce> {
+impl<T: Serialize + DeserializeOwned, R: Retries> SimReceiver<T, TotalOrder, R> {
     /// Receives the next message from the external bincode stream. This will wait until a message
     /// is available, or return `None` if no more messages can possibly arrive.
     pub async fn next(&self) -> Option<T> {
@@ -635,7 +777,7 @@ impl<T: Serialize + DeserializeOwned> SimReceiver<T, TotalOrder, ExactlyOnce> {
     pub fn assert_yields<T2: Debug, I: IntoIterator<Item = T2>>(
         &self,
         expected: I,
-    ) -> impl use<'_, T, T2, I> + Future<Output = ()>
+    ) -> impl use<'_, T, T2, I, R> + Future<Output = ()>
     where
         T: Debug + PartialEq<T2>,
     {
@@ -670,7 +812,7 @@ impl<T: Serialize + DeserializeOwned> SimReceiver<T, TotalOrder, ExactlyOnce> {
     pub fn assert_yields_only<T2: Debug, I: IntoIterator<Item = T2>>(
         &self,
         expected: I,
-    ) -> impl use<'_, T, T2, I> + Future<Output = ()>
+    ) -> impl use<'_, T, T2, I, R> + Future<Output = ()>
     where
         T: Debug + PartialEq<T2>,
     {
@@ -1054,6 +1196,9 @@ struct LaunchedSim<W: std::io::Write> {
 
 impl<W: std::io::Write> LaunchedSim<W> {
     async fn scheduler(&mut self) {
+        let mut lasso_detector = LassoDetector::new(200);
+        let mut force_delivery_targets: Vec<(LocationId, Option<u32>, usize)> = Vec::new();
+
         loop {
             tokio::task::yield_now().await;
             let mut any_made_progress = false;
@@ -1186,6 +1331,13 @@ impl<W: std::io::Write> LaunchedSim<W> {
                         let hooks = self.hooks.get_mut(&(removed.0.clone(), removed.1)).unwrap();
                         run_hooks(&mut tick_decision_writer, hooks);
 
+                        // Record deliveries from lossy hooks for fairness tracking
+                        for (i, hook) in hooks.iter().enumerate() {
+                            if hook.is_lossy() && hook.current_decision() == Some(true) {
+                                lasso_detector.record_delivery(&removed.0, removed.1, i);
+                            }
+                        }
+
                         let run_tick_future = removed.2.run_tick();
                         if let Some(inline_hooks) =
                             self.inline_hooks.get_mut(&(removed.0.clone(), removed.1))
@@ -1221,13 +1373,52 @@ impl<W: std::io::Write> LaunchedSim<W> {
                         self.possibly_ready_ticks.push(removed);
                     } else {
                         let next_obs = next_tick_or_obs - self.possibly_ready_ticks.len();
+                        let obs_key = self.possibly_ready_observation[next_obs].clone();
+
+                        // Run lasso detection before resolving lossy observations
+                        let has_lossy = self.hooks.get(&obs_key)
+                            .map(|hs| hs.iter().any(|h| h.is_lossy() && h.can_make_nontrivial_decision()))
+                            .unwrap_or(false);
+                        if has_lossy {
+                            match lasso_detector.step(&self.hooks) {
+                                LassoResult::ForceDelivery(starved) => {
+                                    force_delivery_targets = starved;
+                                }
+                                LassoResult::LivenessViolation | LassoResult::Truncated => {
+                                    // Declare quiescence — the test will fail if liveness expected
+                                    self.quiescence.wait_for_resume().await;
+                                    continue;
+                                }
+                                LassoResult::Continue => {}
+                            }
+                        }
+
+                        // Determine which hook indices should be forced (from lasso detection)
+                        let force_indices: Vec<usize> = force_delivery_targets
+                            .iter()
+                            .filter(|(loc, cid, _)| *loc == obs_key.0 && *cid == obs_key.1)
+                            .map(|(_, _, idx)| *idx)
+                            .collect();
+
                         let mut default_hooks = vec![];
                         let hooks = self
                             .hooks
-                            .get_mut(&self.possibly_ready_observation[next_obs])
+                            .get_mut(&obs_key)
                             .unwrap_or(&mut default_hooks);
 
-                        run_hooks(&mut self.log, hooks);
+                        run_hooks_with_force(&mut self.log, hooks, &force_indices);
+
+                        // Record deliveries from lossy hooks for fairness tracking
+                        for (i, hook) in hooks.iter().enumerate() {
+                            if hook.is_lossy() && hook.current_decision() == Some(true) {
+                                lasso_detector.record_delivery(&obs_key.0, obs_key.1, i);
+                            }
+                        }
+
+                        // Clear force targets that were just applied
+                        force_delivery_targets.retain(|(loc, cid, _)| {
+                            !(*loc == obs_key.0 && *cid == obs_key.1)
+                        });
                     }
                 }
             }
@@ -1236,31 +1427,57 @@ impl<W: std::io::Write> LaunchedSim<W> {
 }
 
 fn run_hooks(tick_decision_writer: &mut impl std::fmt::Write, hooks: &mut Vec<Box<dyn SimHook>>) {
-    let mut remaining_decision_count = hooks.len();
+    run_hooks_with_force(tick_decision_writer, hooks, &[])
+}
+
+/// Run hooks, optionally forcing specific hook indices to deliver.
+/// Lossy hooks are exempt from the default "must make at least one nontrivial decision"
+/// constraint unless they appear in `force_indices`.
+fn run_hooks_with_force(
+    tick_decision_writer: &mut impl std::fmt::Write,
+    hooks: &mut Vec<Box<dyn SimHook>>,
+    force_indices: &[usize],
+) {
     let mut made_nontrivial_decision = false;
+
+    // Pre-compute which hooks are lossy and which can make nontrivial decisions
+    let hook_is_lossy: Vec<bool> = hooks.iter().map(|h| h.is_lossy()).collect();
+    let non_lossy_undecided: Vec<bool> = hooks
+        .iter()
+        .map(|h| !h.is_lossy() && h.current_decision().is_none() && h.can_make_nontrivial_decision())
+        .collect();
+    let total_non_lossy_undecided: usize = non_lossy_undecided.iter().filter(|&&b| b).count();
 
     bolero::generator::bolero_generator::any::scope::borrow_with(|driver| {
         // first, scan manual decisions
         hooks.iter_mut().for_each(|hook| {
             if let Some(is_nontrivial) = hook.current_decision() {
                 made_nontrivial_decision |= is_nontrivial;
-                remaining_decision_count -= 1;
             } else if !hook.can_make_nontrivial_decision() {
                 // if no nontrivial decision is possible, make a trivial one
                 // (we need to do this in the first pass to force nontrivial decisions
                 // on the remaining hooks)
                 hook.autonomous_decision(driver, false);
-                remaining_decision_count -= 1;
             }
         });
 
-        hooks.iter_mut().for_each(|hook| {
+        let mut non_lossy_remaining = total_non_lossy_undecided;
+        hooks.iter_mut().enumerate().for_each(|(idx, hook)| {
             if hook.current_decision().is_none() {
-                made_nontrivial_decision |= hook.autonomous_decision(
-                    driver,
-                    !made_nontrivial_decision && remaining_decision_count == 1,
-                );
-                remaining_decision_count -= 1;
+                let force = if force_indices.contains(&idx) {
+                    // Lasso detector is forcing this lossy hook to deliver
+                    true
+                } else if hook_is_lossy[idx] {
+                    // Lossy hooks are never forced by the default constraint
+                    false
+                } else {
+                    // Non-lossy hooks: force the last undecided one if no nontrivial decision yet
+                    if non_lossy_undecided[idx] {
+                        non_lossy_remaining -= 1;
+                    }
+                    !made_nontrivial_decision && non_lossy_undecided[idx] && non_lossy_remaining == 0
+                };
+                made_nontrivial_decision |= hook.autonomous_decision(driver, force);
             }
 
             hook.release_decision(tick_decision_writer);

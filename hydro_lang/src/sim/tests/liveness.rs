@@ -29,11 +29,9 @@
 
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use stageleft::q;
 
-use crate::live_collections::stream::{ExactlyOnce, TotalOrder};
-use crate::location::{Location, Process};
+use crate::location::Location;
 use crate::networking::TCP;
 use crate::nondet::nondet;
 use crate::prelude::FlowBuilder;
@@ -56,7 +54,7 @@ use crate::prelude::FlowBuilder;
 /// ```
 #[cfg(feature = "sim")]
 #[test]
-#[ignore = "requires lossy network support in simulator (not yet implemented)"]
+#[ignore = "requires source_interval/sample_every support in simulator (Task 6)"]
 fn liveness_sample_every_over_lossy() {
     let mut flow = FlowBuilder::new();
     let sender_loc = flow.process::<()>();
@@ -92,7 +90,6 @@ fn liveness_sample_every_over_lossy() {
 #[cfg(feature = "sim")]
 #[test]
 #[should_panic]
-#[ignore = "requires lossy network support in simulator (not yet implemented)"]
 fn liveness_single_send_over_lossy_fails() {
     let mut flow = FlowBuilder::new();
     let sender_loc = flow.process::<()>();
@@ -137,7 +134,7 @@ fn liveness_single_send_over_lossy_fails() {
 /// ```
 #[cfg(feature = "sim")]
 #[test]
-#[ignore = "requires lossy network support in simulator (not yet implemented)"]
+#[ignore = "requires source_interval/sample_every support in simulator (Task 6)"]
 fn liveness_retry_with_ack() {
     let mut flow = FlowBuilder::new();
     let sender_loc = flow.process::<()>();

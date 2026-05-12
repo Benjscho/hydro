@@ -3091,7 +3091,7 @@ mod tests {
     use crate::compile::builder::FlowBuilder;
     #[cfg(feature = "deploy")]
     use crate::live_collections::sliced::sliced;
-    #[cfg(feature = "deploy")]
+    #[cfg(any(feature = "deploy", feature = "sim"))]
     use crate::live_collections::stream::ExactlyOnce;
     #[cfg(feature = "sim")]
     use crate::live_collections::stream::NoOrder;
@@ -4019,8 +4019,8 @@ mod tests {
         let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
 
-        let (in_send, input) = node.sim_input();
-        let (_in_send2, input2) = node.sim_input();
+        let (in_send, input) = node.sim_input::<i32, TotalOrder, ExactlyOnce>();
+        let (_in_send2, input2) = node.sim_input::<i32, TotalOrder, ExactlyOnce>();
 
         let out_recv = input
             .merge_ordered(input2, nondet!(/** test */))

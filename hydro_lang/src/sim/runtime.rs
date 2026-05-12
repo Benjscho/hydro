@@ -74,6 +74,19 @@ pub trait SimHook {
     fn is_ready(&self) -> bool {
         true
     }
+
+    /// Whether this hook represents a lossy network channel. Lossy hooks are
+    /// exempt from the "must make at least one nontrivial decision" constraint
+    /// and instead rely on lasso-based fairness to force eventual delivery.
+    fn is_lossy(&self) -> bool {
+        false
+    }
+
+    /// Returns the number of pending items in this hook's buffer.
+    /// Used by the lasso detector to compute state fingerprints.
+    fn pending_count(&self) -> usize {
+        0
+    }
 }
 
 /// A hook that can make inline decisions during the execution of a tick.
@@ -180,6 +193,7 @@ pub struct StreamHook<T, Order: Ordering> {
     pub output: UnboundedSender<T>,
     pub batch_location: HookLocationMeta,
     pub format_item_debug: fn(&T) -> Option<String>,
+    pub lossy: bool,
     pub _order: std::marker::PhantomData<Order>,
 }
 
@@ -192,18 +206,48 @@ impl<T> SimHook for StreamHook<T, TotalOrder> {
         !self.input.borrow().is_empty()
     }
 
+    fn is_lossy(&self) -> bool {
+        self.lossy
+    }
+
+    fn pending_count(&self) -> usize {
+        self.input.borrow().len()
+    }
+
     fn autonomous_decision<'a>(
         &mut self,
         driver: &mut Borrowed<'a>,
         force_nontrivial: bool,
     ) -> bool {
         let mut current_input = self.input.borrow_mut();
-        let count = ((if force_nontrivial { 1 } else { 0 })..=current_input.len())
-            .generate(driver)
-            .unwrap();
 
-        self.to_release = Some(current_input.drain(0..count).collect());
-        count > 0
+        if self.lossy {
+            // Lossy mode: drain some items, then decide how many to actually deliver.
+            // Items drained but not delivered are permanently dropped.
+            if current_input.is_empty() {
+                self.to_release = Some(vec![]);
+                return false;
+            }
+
+            // Drain at least 1 item (to ensure progress), up to all items
+            let drain_count = (1..=current_input.len()).generate(driver).unwrap();
+            let drained: Vec<T> = current_input.drain(0..drain_count).collect();
+
+            // Of the drained items, deliver 0..=drain_count
+            let deliver_count = ((if force_nontrivial { 1 } else { 0 })..=drained.len())
+                .generate(driver)
+                .unwrap();
+
+            self.to_release = Some(drained.into_iter().take(deliver_count).collect());
+            deliver_count > 0
+        } else {
+            let count = ((if force_nontrivial { 1 } else { 0 })..=current_input.len())
+                .generate(driver)
+                .unwrap();
+
+            self.to_release = Some(current_input.drain(0..count).collect());
+            count > 0
+        }
     }
 
     fn release_decision(&mut self, log_writer: &mut dyn std::fmt::Write) {
@@ -257,37 +301,64 @@ impl<T> SimHook for StreamHook<T, NoOrder> {
         !self.input.borrow().is_empty()
     }
 
+    fn is_lossy(&self) -> bool {
+        self.lossy
+    }
+
+    fn pending_count(&self) -> usize {
+        self.input.borrow().len()
+    }
+
     fn autonomous_decision<'a>(
         &mut self,
         driver: &mut Borrowed<'a>,
         force_nontrivial: bool,
     ) -> bool {
         let mut current_input = self.input.borrow_mut();
-        let mut out = vec![];
-        let mut min_index = 0;
-        while !current_input.is_empty() {
-            let must_release = force_nontrivial && out.is_empty();
-            if !must_release && produce().generate(driver).unwrap() {
-                break;
+
+        if self.lossy {
+            // Lossy mode: drain some items, deliver a subset, drop the rest.
+            if current_input.is_empty() {
+                self.to_release = Some(vec![]);
+                return false;
             }
 
-            let idx = (min_index..current_input.len()).generate(driver).unwrap();
-            let item = current_input.remove(idx).unwrap();
-            out.push(item);
+            let drain_count = (1..=current_input.len()).generate(driver).unwrap();
+            let drained: Vec<T> = current_input.drain(0..drain_count).collect();
 
-            min_index = idx;
-            // Next time, only consider items at or after this index. The reason this is safe is
-            // because batching a `NoOrder` streams results in batches with a `NoOrder` guarantee.
-            // Therefore, simulating different order of elements _within_ a batch is redundant.
+            let deliver_count = ((if force_nontrivial { 1 } else { 0 })..=drained.len())
+                .generate(driver)
+                .unwrap();
 
-            if min_index == current_input.len() {
-                break;
+            self.to_release = Some(drained.into_iter().take(deliver_count).collect());
+            deliver_count > 0
+        } else {
+            let mut out = vec![];
+            let mut min_index = 0;
+            while !current_input.is_empty() {
+                let must_release = force_nontrivial && out.is_empty();
+                if !must_release && produce().generate(driver).unwrap() {
+                    break;
+                }
+
+                let idx = (min_index..current_input.len()).generate(driver).unwrap();
+                let item = current_input.remove(idx).unwrap();
+                out.push(item);
+
+                min_index = idx;
+                // Next time, only consider items at or after this index. The reason this is safe is
+                // because batching a `NoOrder` streams results in batches with a `NoOrder` guarantee.
+                // Therefore, simulating different order of elements _within_ a batch is redundant.
+
+                if min_index == current_input.len() {
+                    break;
+                }
             }
+
+            let was_nontrivial = !out.is_empty();
+            self.to_release = Some(out);
+            was_nontrivial
         }
-
-        let was_nontrivial = !out.is_empty();
-        self.to_release = Some(out);
-        was_nontrivial
     }
 
     fn release_decision(&mut self, log_writer: &mut dyn std::fmt::Write) {
