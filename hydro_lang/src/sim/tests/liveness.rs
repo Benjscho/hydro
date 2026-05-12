@@ -54,7 +54,6 @@ use crate::prelude::FlowBuilder;
 /// ```
 #[cfg(feature = "sim")]
 #[test]
-#[ignore = "blocked on scheduler architecture: lossy hook observation never becomes ready"]
 fn liveness_sample_every_over_lossy() {
     let mut flow = FlowBuilder::new();
     let sender_loc = flow.process::<()>();
@@ -134,7 +133,6 @@ fn liveness_single_send_over_lossy_fails() {
 /// ```
 #[cfg(feature = "sim")]
 #[test]
-#[ignore = "blocked on scheduler architecture: lossy hook observation never becomes ready"]
 fn liveness_retry_with_ack() {
     let mut flow = FlowBuilder::new();
     let sender_loc = flow.process::<()>();
