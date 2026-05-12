@@ -192,6 +192,7 @@ impl DfirBuilder for SimBuilder {
                                 output: #hoff_send_ident,
                                 batch_location: (#batch_location, #line, #caret),
                                 format_item_debug: #root::__maybe_debug__!(#element_type),
+                                lossy: false,
                                 _order: std::marker::PhantomData,
                             })
                         ),
@@ -1190,9 +1191,10 @@ impl DfirBuilder for SimBuilder {
         networking_info: &crate::networking::NetworkingInfo,
     ) {
         use crate::networking::{NetworkingInfo, TcpFault};
-        match networking_info {
+        let is_lossy = match networking_info {
             NetworkingInfo::Tcp { fault } => match fault {
-                TcpFault::FailStop => {}
+                TcpFault::FailStop => false,
+                TcpFault::Lossy => true,
                 TcpFault::LossyDelayedForever => {
                     assert!(
                         self.test_safety_only,
@@ -1201,14 +1203,395 @@ impl DfirBuilder for SimBuilder {
                          delayed, which only tests safety (not liveness). Call \
                          `.sim().test_safety_only()` to opt in."
                     );
+                    // LossyDelayedForever uses the same wiring as FailStop (safety-only)
+                    false
                 }
-                _ => todo!(
-                    "SimBuilder only supports fail-stop and lossy-delayed-forever TCP networking"
-                ),
             },
-        }
+        };
 
         let root = get_this_crate();
+
+        if is_lossy {
+            // For lossy networks, route through a StreamHook that can non-deterministically
+            // drop messages. The hook is registered at the receiver's location.
+            let hoff_id = self.next_hoff_id;
+            self.next_hoff_id += 1;
+            let buffered_ident =
+                syn::Ident::new(&format!("__lossy_buf_{hoff_id}"), Span::call_site());
+            let hoff_send_ident =
+                syn::Ident::new(&format!("__lossy_hoff_send_{hoff_id}"), Span::call_site());
+            let hoff_recv_ident =
+                syn::Ident::new(&format!("__lossy_hoff_recv_{hoff_id}"), Span::call_site());
+
+            match (from, to) {
+                (LocationId::Process(_), LocationId::Process(_)) => {
+                    self.extra_stmts_global.push(syn::parse_quote! {
+                        let (#sink, #source) = __root_dfir_rs::util::unbounded_channel::<__root_dfir_rs::bytes::Bytes>();
+                    });
+
+                    // Sender side: serialize and send into the channel
+                    if let Some(serialize_pipeline) = serialize {
+                        self.get_dfir_mut(from).add_dfir(
+                            parse_quote! {
+                                #input_ident -> map(#serialize_pipeline) -> for_each(|v| #sink.send(v).unwrap());
+                            },
+                            None,
+                            Some(&format!("send{}", tag_id)),
+                        );
+                    } else {
+                        self.get_dfir_mut(from).add_dfir(
+                            parse_quote! {
+                                #input_ident -> for_each(|v| #sink.send(v).unwrap());
+                            },
+                            None,
+                            Some(&format!("send{}", tag_id)),
+                        );
+                    }
+
+                    // Receiver side: route through a lossy hook
+                    self.extra_stmts_global.push(syn::parse_quote! {
+                        let #buffered_ident = ::std::rc::Rc::new(::std::cell::RefCell::new(::std::collections::VecDeque::new()));
+                    });
+                    self.extra_stmts_global.push(syn::parse_quote! {
+                        let (#hoff_send_ident, #hoff_recv_ident) = __root_dfir_rs::util::unbounded_channel();
+                    });
+
+                    self.add_hook(
+                        to,
+                        to,
+                        syn::parse_quote!(
+                            Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
+                                input: #buffered_ident.clone(),
+                                to_release: None,
+                                output: #hoff_send_ident,
+                                batch_location: ("lossy network", "", ""),
+                                format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
+                                lossy: true,
+                                _order: std::marker::PhantomData,
+                            })
+                        ),
+                    );
+
+                    // Feed incoming messages into the buffer
+                    self.get_dfir_mut(to).add_dfir(
+                        parse_quote! {
+                            source_stream(#source) -> for_each(|v| #buffered_ident.borrow_mut().push_back(v));
+                        },
+                        None,
+                        Some(&format!("lossy_buf{}", tag_id)),
+                    );
+
+                    // Read from the hook's output
+                    if let Some(deserialize_pipeline) = deserialize {
+                        self.get_dfir_mut(to).add_dfir(
+                            parse_quote! {
+                                #out_ident = source_stream(#hoff_recv_ident) -> map(|v| -> ::std::result::Result<_, ()> { Ok(v) }) -> map(#deserialize_pipeline);
+                            },
+                            None,
+                            Some(&format!("recv{}", tag_id)),
+                        );
+                    } else {
+                        self.get_dfir_mut(to).add_dfir(
+                            parse_quote! {
+                                #out_ident = source_stream(#hoff_recv_ident);
+                            },
+                            None,
+                            Some(&format!("recv{}", tag_id)),
+                        );
+                    }
+                }
+                (LocationId::Cluster(_), LocationId::Process(_)) => {
+                    self.extra_stmts_global.push(syn::parse_quote! {
+                        let (#sink, #source) = __root_dfir_rs::util::unbounded_channel::<(#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)>();
+                    });
+
+                    self.extra_stmts_cluster
+                        .entry(from.clone())
+                        .or_default()
+                        .push(syn::parse_quote! {
+                            let #sink = #sink.clone();
+                        });
+
+                    if let Some(serialize_pipeline) = serialize {
+                        self.get_dfir_mut(from).add_dfir(
+                            parse_quote! {
+                                #input_ident -> map(#serialize_pipeline) -> for_each(|v| #sink.send((#root::__staged::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
+                            },
+                            None,
+                            Some(&format!("send{}", tag_id)),
+                        );
+                    } else {
+                        self.get_dfir_mut(from).add_dfir(
+                            parse_quote! {
+                                #input_ident -> for_each(|v| #sink.send((#root::__staged::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
+                            },
+                            None,
+                            Some(&format!("send{}", tag_id)),
+                        );
+                    }
+
+                    // Receiver side: route through a lossy hook
+                    self.extra_stmts_global.push(syn::parse_quote! {
+                        let #buffered_ident = ::std::rc::Rc::new(::std::cell::RefCell::new(::std::collections::VecDeque::new()));
+                    });
+                    self.extra_stmts_global.push(syn::parse_quote! {
+                        let (#hoff_send_ident, #hoff_recv_ident) = __root_dfir_rs::util::unbounded_channel();
+                    });
+
+                    self.add_hook(
+                        to,
+                        to,
+                        syn::parse_quote!(
+                            Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
+                                input: #buffered_ident.clone(),
+                                to_release: None,
+                                output: #hoff_send_ident,
+                                batch_location: ("lossy network", "", ""),
+                                format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
+                                lossy: true,
+                                _order: std::marker::PhantomData,
+                            })
+                        ),
+                    );
+
+                    self.get_dfir_mut(to).add_dfir(
+                        parse_quote! {
+                            source_stream(#source) -> for_each(|v| #buffered_ident.borrow_mut().push_back(v));
+                        },
+                        None,
+                        Some(&format!("lossy_buf{}", tag_id)),
+                    );
+
+                    if let Some(deserialize_pipeline) = deserialize {
+                        self.get_dfir_mut(to).add_dfir(
+                            parse_quote! {
+                                #out_ident = source_stream(#hoff_recv_ident) -> map(|v| -> ::std::result::Result<_, ()> { Ok(v) }) -> map(#deserialize_pipeline);
+                            },
+                            None,
+                            Some(&format!("recv{}", tag_id)),
+                        );
+                    } else {
+                        self.get_dfir_mut(to).add_dfir(
+                            parse_quote! {
+                                #out_ident = source_stream(#hoff_recv_ident);
+                            },
+                            None,
+                            Some(&format!("recv{}", tag_id)),
+                        );
+                    }
+                }
+                (LocationId::Process(_), LocationId::Cluster(_)) => {
+                    let sink_writer = syn::Ident::new(
+                        &format!("__cloned_{}", sink.to_token_stream()),
+                        Span::call_site(),
+                    );
+                    self.extra_stmts_global.push(syn::parse_quote! {
+                        let #sink: ::std::rc::Rc<::std::cell::RefCell<Vec<__root_dfir_rs::tokio::sync::mpsc::UnboundedSender<__root_dfir_rs::bytes::Bytes>>>> = ::std::rc::Rc::new(::std::cell::RefCell::new(Vec::new()));
+                    });
+
+                    self.extra_stmts_global.push(syn::parse_quote! {
+                        let #sink_writer = #sink.clone();
+                    });
+
+                    self.extra_stmts_cluster
+                        .entry(to.clone())
+                        .or_default()
+                        .push(syn::parse_quote! {
+                            let #source = {
+                                let (__sink, __source) = __root_dfir_rs::util::unbounded_channel::<__root_dfir_rs::bytes::Bytes>();
+                                #sink_writer.borrow_mut().push(__sink);
+                                __source
+                            };
+                        });
+
+                    if let Some(serialize_pipeline) = serialize {
+                        self.get_dfir_mut(from).add_dfir(
+                            parse_quote! {
+                                #input_ident -> map(#serialize_pipeline) -> for_each(|(target_member_id, v)| (#sink.borrow())[#root::__staged::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send(v).unwrap());
+                            },
+                            None,
+                            Some(&format!("send{}", tag_id)),
+                        );
+                    } else {
+                        self.get_dfir_mut(from).add_dfir(
+                            parse_quote! {
+                                #input_ident -> for_each(|(target_member_id, v)| (#sink.borrow())[#root::__staged::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send(v).unwrap());
+                            },
+                            None,
+                            Some(&format!("send{}", tag_id)),
+                        );
+                    }
+
+                    // Receiver side: route through a lossy hook (per cluster member)
+                    self.extra_stmts_cluster
+                        .entry(to.clone())
+                        .or_default()
+                        .push(syn::parse_quote! {
+                            let #buffered_ident = ::std::rc::Rc::new(::std::cell::RefCell::new(::std::collections::VecDeque::new()));
+                        });
+                    self.extra_stmts_cluster
+                        .entry(to.clone())
+                        .or_default()
+                        .push(syn::parse_quote! {
+                            let (#hoff_send_ident, #hoff_recv_ident) = __root_dfir_rs::util::unbounded_channel();
+                        });
+
+                    self.add_hook(
+                        to,
+                        to,
+                        syn::parse_quote!(
+                            Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
+                                input: #buffered_ident.clone(),
+                                to_release: None,
+                                output: #hoff_send_ident,
+                                batch_location: ("lossy network", "", ""),
+                                format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
+                                lossy: true,
+                                _order: std::marker::PhantomData,
+                            })
+                        ),
+                    );
+
+                    self.get_dfir_mut(to).add_dfir(
+                        parse_quote! {
+                            source_stream(#source) -> for_each(|v| #buffered_ident.borrow_mut().push_back(v));
+                        },
+                        None,
+                        Some(&format!("lossy_buf{}", tag_id)),
+                    );
+
+                    if let Some(deserialize_pipeline) = deserialize {
+                        self.get_dfir_mut(to).add_dfir(
+                            parse_quote! {
+                                #out_ident = source_stream(#hoff_recv_ident) -> map(|v| -> ::std::result::Result<_, ()> { Ok(v) }) -> map(#deserialize_pipeline);
+                            },
+                            None,
+                            Some(&format!("recv{}", tag_id)),
+                        );
+                    } else {
+                        self.get_dfir_mut(to).add_dfir(
+                            parse_quote! {
+                                #out_ident = source_stream(#hoff_recv_ident);
+                            },
+                            None,
+                            Some(&format!("recv{}", tag_id)),
+                        );
+                    }
+                }
+                (LocationId::Cluster(_), LocationId::Cluster(_)) => {
+                    let sink_writer = syn::Ident::new(
+                        &format!("__cloned_{}", sink.to_token_stream()),
+                        Span::call_site(),
+                    );
+                    self.extra_stmts_global.push(syn::parse_quote! {
+                        let #sink: ::std::rc::Rc<::std::cell::RefCell<Vec<__root_dfir_rs::tokio::sync::mpsc::UnboundedSender<(#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)>>>> = ::std::rc::Rc::new(::std::cell::RefCell::new(Vec::new()));
+                    });
+
+                    self.extra_stmts_global.push(syn::parse_quote! {
+                        let #sink_writer = #sink.clone();
+                    });
+
+                    self.extra_stmts_cluster
+                        .entry(from.clone())
+                        .or_default()
+                        .push(syn::parse_quote! {
+                            let #sink = #sink.clone();
+                        });
+
+                    self.extra_stmts_cluster
+                        .entry(to.clone())
+                        .or_default()
+                        .push(syn::parse_quote! {
+                            let #source = {
+                                let (__sink, __source) = __root_dfir_rs::util::unbounded_channel::<(#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)>();
+                                #sink_writer.borrow_mut().push(__sink);
+                                __source
+                            };
+                        });
+
+                    if let Some(serialize_pipeline) = serialize {
+                        self.get_dfir_mut(from).add_dfir(
+                            parse_quote! {
+                                #input_ident -> map(#serialize_pipeline) -> for_each(|(target_member_id, v)| (#sink.borrow())[#root::__staged::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send((#root::__staged::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
+                            },
+                            None,
+                            Some(&format!("send{}", tag_id)),
+                        );
+                    } else {
+                        self.get_dfir_mut(from).add_dfir(
+                            parse_quote! {
+                                #input_ident -> for_each(|(target_member_id, v)| (#sink.borrow())[#root::__staged::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send((#root::__staged::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
+                            },
+                            None,
+                            Some(&format!("send{}", tag_id)),
+                        );
+                    }
+
+                    // Receiver side: route through a lossy hook (per cluster member)
+                    self.extra_stmts_cluster
+                        .entry(to.clone())
+                        .or_default()
+                        .push(syn::parse_quote! {
+                            let #buffered_ident = ::std::rc::Rc::new(::std::cell::RefCell::new(::std::collections::VecDeque::new()));
+                        });
+                    self.extra_stmts_cluster
+                        .entry(to.clone())
+                        .or_default()
+                        .push(syn::parse_quote! {
+                            let (#hoff_send_ident, #hoff_recv_ident) = __root_dfir_rs::util::unbounded_channel();
+                        });
+
+                    self.add_hook(
+                        to,
+                        to,
+                        syn::parse_quote!(
+                            Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
+                                input: #buffered_ident.clone(),
+                                to_release: None,
+                                output: #hoff_send_ident,
+                                batch_location: ("lossy network", "", ""),
+                                format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
+                                lossy: true,
+                                _order: std::marker::PhantomData,
+                            })
+                        ),
+                    );
+
+                    self.get_dfir_mut(to).add_dfir(
+                        parse_quote! {
+                            source_stream(#source) -> for_each(|v| #buffered_ident.borrow_mut().push_back(v));
+                        },
+                        None,
+                        Some(&format!("lossy_buf{}", tag_id)),
+                    );
+
+                    if let Some(deserialize_pipeline) = deserialize {
+                        self.get_dfir_mut(to).add_dfir(
+                            parse_quote! {
+                                #out_ident = source_stream(#hoff_recv_ident) -> map(|v| -> ::std::result::Result<_, ()> { Ok(v) }) -> map(#deserialize_pipeline);
+                            },
+                            None,
+                            Some(&format!("recv{}", tag_id)),
+                        );
+                    } else {
+                        self.get_dfir_mut(to).add_dfir(
+                            parse_quote! {
+                                #out_ident = source_stream(#hoff_recv_ident);
+                            },
+                            None,
+                            Some(&format!("recv{}", tag_id)),
+                        );
+                    }
+                }
+                _ => {
+                    panic!(
+                        "Simulations do not yet support network between {:?} and {:?}",
+                        from, to
+                    );
+                }
+            }
+            return;
+        }
 
         match (from, to) {
             (LocationId::Process(_), LocationId::Process(_)) => {
