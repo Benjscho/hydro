@@ -163,6 +163,7 @@ impl<'a> BuiltFlow<'a> {
             externals_port_registry: Default::default(),
             test_safety_only: false,
             unit_test_fuzz_iterations: 8192,
+            max_lasso_steps: 200,
             _phantom: PhantomData,
         }
     }

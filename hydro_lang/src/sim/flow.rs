@@ -41,6 +41,9 @@ pub struct SimFlow<'a> {
     /// Number of iterations to use for fuzzing, defaults to 8192
     pub(crate) unit_test_fuzz_iterations: usize,
 
+    /// Maximum steps for the lasso detector before truncation, defaults to 200
+    pub(crate) max_lasso_steps: usize,
+
     pub(crate) _phantom: Invariant<'a>,
 }
 
@@ -68,6 +71,15 @@ impl<'a> SimFlow<'a> {
     /// the default value of 8192
     pub fn unit_test_fuzz_iterations(mut self, iterations: usize) -> Self {
         self.unit_test_fuzz_iterations = iterations;
+        self
+    }
+
+    /// Sets the maximum number of steps the lasso detector will take before
+    /// declaring truncation. Lower values speed up exhaustive testing by reducing
+    /// the depth of each execution path, at the cost of potentially missing bugs
+    /// that require longer executions. Defaults to 200.
+    pub fn max_lasso_steps(mut self, steps: usize) -> Self {
+        self.max_lasso_steps = steps;
         self
     }
 
@@ -209,6 +221,7 @@ impl<'a> SimFlow<'a> {
             lib,
             externals_port_registry: self.externals_port_registry.take(),
             unit_test_fuzz_iterations: self.unit_test_fuzz_iterations,
+            max_lasso_steps: self.max_lasso_steps,
         }
     }
 }
