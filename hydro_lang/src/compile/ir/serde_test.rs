@@ -62,8 +62,12 @@ mod tests {
                 r#"{"Stream":"q!(my_stream)"}"#,
             ),
             (HydroSource::ExternalNetwork(), r#"{"ExternalNetwork":[]}"#),
-            (HydroSource::Iter(expr), r#"{"Iter":"q!(my_stream)"}"#),
+            (HydroSource::Iter(expr.clone()), r#"{"Iter":"q!(my_stream)"}"#),
             (HydroSource::Spin(), r#"{"Spin":[]}"#),
+            (
+                HydroSource::Interval(expr),
+                r#"{"Interval":"q!(my_stream)"}"#,
+            ),
             (
                 HydroSource::ClusterMembers(loc, ClusterMembersState::Uninit),
                 r#"{"ClusterMembers":[{"Process":{"idx":1,"version":255}},"Uninit"]}"#,

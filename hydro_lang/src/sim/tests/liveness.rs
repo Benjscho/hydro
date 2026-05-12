@@ -54,14 +54,14 @@ use crate::prelude::FlowBuilder;
 /// ```
 #[cfg(feature = "sim")]
 #[test]
-#[ignore = "requires source_interval/sample_every support in simulator (Task 6)"]
+#[ignore = "blocked on scheduler architecture: lossy hook observation never becomes ready"]
 fn liveness_sample_every_over_lossy() {
     let mut flow = FlowBuilder::new();
     let sender_loc = flow.process::<()>();
     let receiver_loc = flow.process::<()>();
 
     // A singleton value that will be repeatedly sampled and sent.
-    let value = sender_loc.source_iter(q!(std::iter::once(123_u32))).fold(
+    let value = sender_loc.source_iter(q!(vec![123_u32])).fold(
         q!(|| 0u32),
         q!(|acc, v| *acc = v),
     );
@@ -134,14 +134,14 @@ fn liveness_single_send_over_lossy_fails() {
 /// ```
 #[cfg(feature = "sim")]
 #[test]
-#[ignore = "requires source_interval/sample_every support in simulator (Task 6)"]
+#[ignore = "blocked on scheduler architecture: lossy hook observation never becomes ready"]
 fn liveness_retry_with_ack() {
     let mut flow = FlowBuilder::new();
     let sender_loc = flow.process::<()>();
     let receiver_loc = flow.process::<()>();
 
     // The payload to send.
-    let payload = sender_loc.source_iter(q!(std::iter::once(42_u32))).fold(
+    let payload = sender_loc.source_iter(q!(vec![42_u32])).fold(
         q!(|| None::<u32>),
         q!(|acc, v| *acc = Some(v)),
     );

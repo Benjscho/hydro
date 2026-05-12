@@ -142,8 +142,10 @@ struct LassoDetector {
 }
 
 struct FairnessRecord {
-    /// For each lossy hook index: did it deliver ≥1 item since last fingerprint?
+    /// For each fairness-subject hook: did it deliver ≥1 item since last fingerprint?
     delivered: HashMap<(LocationId, Option<u32>, usize), bool>,
+    /// For each fairness-subject hook: was it enabled (had pending items) at this step?
+    enabled: HashMap<(LocationId, Option<u32>, usize), bool>,
 }
 ```
 
@@ -151,36 +153,47 @@ struct FairnessRecord {
 
 **File**: `hydro_lang/src/sim/compiled.rs`
 
-After each round of hook resolution, if any lossy hook has pending items:
-1. Compute fingerprint
-2. Check for repeated fingerprint in trace
-3. If repeated: validate fairness of the cycle
-   - Unfair → set `force_nontrivial = true` on starved lossy hooks for next round
-   - Fair + hot → declare quiescence (liveness violation found)
-4. If max_steps exceeded → declare quiescence (truncate)
+Lasso detection now runs globally before each scheduling decision (not per-observation). After detecting a repeated fingerprint:
+1. Compute which hooks were enabled at any point during the cycle
+2. If all enabled hooks delivered → fair lasso → LivenessViolation
+3. If some enabled hooks never delivered → unfair lasso → ForceDelivery
+4. If max_steps exceeded → Truncated
 
 ### Task 5: Enable liveness tests ⚠️ PARTIALLY DONE
 
 **File**: `hydro_lang/src/sim/tests/liveness.rs`
 
 - `liveness_single_send_over_lossy_fails` — runs and passes ✅
-- `liveness_sample_every_over_lossy` — `#[ignore]`, blocked on Task 6
-- `liveness_retry_with_ack` — `#[ignore]`, blocked on Task 6
+- `liveness_sample_every_over_lossy` — `#[ignore]`, blocked on scheduler issue
+- `liveness_retry_with_ack` — `#[ignore]`, blocked on scheduler issue
 
-### Task 6: `source_interval` in sim 🔲 NOT STARTED
+### Task 6: `source_interval` in sim ⚠️ PARTIALLY DONE
 
 **Design**: See `design_docs/2025-01_sample_every_in_sim.md`
 
-`source_interval` uses `tokio::time::interval` which requires the time driver. The simulator doesn't enable it. The solution is to replace `source_interval` with a non-deterministic self-replenishing hook in the sim (Layer 2: relative time), subject to lasso-based weak fairness.
-
 Sub-tasks:
-1. Add `HydroSource::Interval(DebugExpr)` to the IR
-2. Update `Location::source_interval` to emit it
-3. Update deploy builder to lower `Interval` to `IntervalStream` (preserves existing behavior)
-4. Sim builder: emit self-replenishing `StreamHook` for `Interval` sources
-5. Add `is_interval` field to `StreamHook`, generalize `is_lossy()` → `is_fairness_subject()`
-6. Update lasso detector to use `is_fairness_subject()` instead of `is_lossy()`
-7. Remove `#[ignore]` from liveness tests
+1. ✅ Add `HydroSource::Interval(DebugExpr)` to the IR
+2. ✅ Update `Location::source_interval` to emit it
+3. ✅ Update deploy builder to lower `Interval` to `IntervalStream` (preserves existing behavior)
+4. ✅ Sim builder: emit `IntervalHook` for `Interval` sources
+5. ✅ Add `is_interval` field to `StreamHook`, generalize `is_lossy()` → `is_fairness_subject()`
+6. ✅ Update lasso detector to use `is_fairness_subject()` instead of `is_lossy()`
+7. 🚫 Remove `#[ignore]` from liveness tests — **BLOCKED** on scheduler issue
+
+### Blocker: Lossy hook observation never becomes ready
+
+The lossy network hook is registered as an **observation** for the receiver's location. The scheduler's observation readiness check filters out observations whose hooks have no pending items. The lossy hook's buffer only gets items AFTER the sender's tick fires, but the readiness check runs BEFORE ticks fire (in the same scheduler iteration).
+
+**Sequence**:
+1. Readiness check → lossy hook empty → receiver's observation filtered out
+2. Scheduler picks sender's tick → tick fires → bytes sent to network channel
+3. Loop restarts → receiver's async DFIR picks up bytes → feeds into lossy buffer
+4. Readiness check → lossy hook NOW has items → receiver's observation IS ready
+5. But the exhaustive explorer also explores the branch where the sender's tick is picked again (step 2), creating an infinite cycle
+
+The lasso detector correctly identifies this as an unfair cycle and issues `ForceDelivery`. The force delivery mechanism keeps the targets persistent and resolves forced observations when they become ready. However, in the exhaustive exploration, there always exists a branch where the scheduler picks the sender's tick/observation instead of the forced receiver's observation, leading to the test failing.
+
+**Proposed fix**: Change the lossy hook from a standalone observation to part of the receiver's **tick** (similar to how batch hooks work). This would make the lossy hook resolve as part of the normal tick execution flow, eliminating the scheduling race. Alternatively, when `ForceDelivery` is active, prune all branches that don't resolve the forced observation (since those branches represent unfair executions that shouldn't be explored).
 
 ## Open Questions
 

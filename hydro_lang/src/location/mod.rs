@@ -1111,9 +1111,21 @@ pub trait Location<'a>: dynamic::DynLocation {
     where
         Self: Sized + NoTick,
     {
-        self.source_stream(q!(tokio_stream::wrappers::IntervalStream::new(
-            tokio::time::interval(interval)
-        )))
+        let e = interval.splice_untyped_ctx(self);
+
+        Stream::new(
+            self.clone(),
+            HydroNode::Source {
+                source: HydroSource::Interval(e.into()),
+                metadata: self.new_node_metadata(Stream::<
+                    tokio::time::Instant,
+                    Self,
+                    Unbounded,
+                    TotalOrder,
+                    ExactlyOnce,
+                >::collection_kind()),
+            },
+        )
     }
 
     /// Generates a stream with values emitted at a fixed interval (with an

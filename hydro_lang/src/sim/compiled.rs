@@ -31,12 +31,12 @@ use crate::sim::graph::{SimExternalPort, SimExternalPortRegistry};
 use crate::sim::runtime::SimHook;
 
 /// State fingerprint for lasso detection. Captures the pending message counts
-/// and which lossy hooks are enabled (can make nontrivial decisions).
+/// and which fairness-subject hooks are enabled (can make nontrivial decisions).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct StateFingerprint {
-    /// Hash of pending counts per lossy hook.
+    /// Hash of pending counts per fairness-subject hook.
     pending_counts: u64,
-    /// Hash of which lossy hooks can make nontrivial decisions.
+    /// Hash of which fairness-subject hooks can make nontrivial decisions.
     enabled_hooks: u64,
 }
 
@@ -48,7 +48,7 @@ impl StateFingerprint {
 
         for ((loc, cid), hook_list) in hooks {
             for (i, hook) in hook_list.iter().enumerate() {
-                if hook.is_lossy() {
+                if hook.is_fairness_subject() {
                     (loc, cid, i, hook.pending_count()).hash(&mut pending_hasher);
                     (loc, cid, i, hook.can_make_nontrivial_decision()).hash(&mut enabled_hasher);
                 }
@@ -62,14 +62,16 @@ impl StateFingerprint {
     }
 }
 
-/// Tracks which lossy hooks have delivered at least one item during a cycle.
+/// Tracks which fairness-subject hooks have delivered at least one item during a cycle.
 struct FairnessRecord {
-    /// For each lossy hook (identified by index in the trace), whether it delivered ≥1 item.
+    /// For each fairness-subject hook, whether it delivered ≥1 item.
     delivered: HashMap<(LocationId, Option<u32>, usize), bool>,
+    /// For each fairness-subject hook, whether it was enabled (had pending items) at this step.
+    enabled: HashMap<(LocationId, Option<u32>, usize), bool>,
 }
 
 /// Detects lasso (repeated state) patterns in the scheduler to enforce weak fairness
-/// on lossy network hooks.
+/// on fairness-subject hooks (lossy networks and interval timers).
 struct LassoDetector {
     /// Trace of (fingerprint, fairness record) at each observation point.
     trace: Vec<(StateFingerprint, FairnessRecord)>,
@@ -107,14 +109,16 @@ impl LassoDetector {
 
         let fingerprint = StateFingerprint::compute(hooks);
 
-        // Build fairness record: which lossy hooks have pending items?
+        // Build fairness record: track ALL fairness-subject hooks.
         let mut record = FairnessRecord {
             delivered: HashMap::new(),
+            enabled: HashMap::new(),
         };
         for ((loc, cid), hook_list) in hooks {
             for (i, hook) in hook_list.iter().enumerate() {
-                if hook.is_lossy() && hook.can_make_nontrivial_decision() {
+                if hook.is_fairness_subject() {
                     record.delivered.insert((loc.clone(), *cid, i), false);
+                    record.enabled.insert((loc.clone(), *cid, i), hook.can_make_nontrivial_decision());
                 }
             }
         }
@@ -125,8 +129,21 @@ impl LassoDetector {
             let &prev_pos = positions.last().unwrap();
             // Check fairness of the cycle from prev_pos to now
             let cycle = &self.trace[prev_pos..];
+
+            // A hook needs to have delivered if it was enabled at ANY point during the cycle
+            // (including the current step).
             #[expect(clippy::disallowed_methods, reason = "HashMap keys iteration order doesn't matter here")]
-            let all_fair = record.delivered.keys().all(|key| {
+            let hooks_needing_delivery: Vec<_> = record.delivered.keys()
+                .filter(|key| {
+                    // Check if this hook was enabled at any point in the cycle or now
+                    record.enabled.get(key).copied() == Some(true)
+                        || cycle.iter().any(|(_, fr)| fr.enabled.get(key).copied() == Some(true))
+                })
+                .cloned()
+                .collect();
+
+            #[expect(clippy::disallowed_methods, reason = "HashMap keys iteration order doesn't matter here")]
+            let all_fair = hooks_needing_delivery.iter().all(|key| {
                 cycle
                     .iter()
                     .any(|(_, fr)| fr.delivered.get(key).copied() == Some(true))
@@ -136,17 +153,14 @@ impl LassoDetector {
                 // Fair lasso — liveness violation
                 return LassoResult::LivenessViolation;
             } else {
-                // Unfair lasso — find starved hooks
-                #[expect(clippy::disallowed_methods, reason = "HashMap keys iteration order doesn't matter here")]
-                let starved: Vec<_> = record
-                    .delivered
-                    .keys()
+                // Unfair lasso — find starved hooks that were enabled
+                let starved: Vec<_> = hooks_needing_delivery
+                    .into_iter()
                     .filter(|key| {
                         !cycle
                             .iter()
                             .any(|(_, fr)| fr.delivered.get(key).copied() == Some(true))
                     })
-                    .cloned()
                     .collect();
                 return LassoResult::ForceDelivery(starved);
             }
@@ -1254,14 +1268,20 @@ impl<W: std::io::Write> LaunchedSim<W> {
                     .possibly_ready_observation
                     .drain(..)
                     .partition(|(name, cid)| {
-                        self.hooks
+                        // An observation is ready if any hook can make a nontrivial decision,
+                        // OR if it has pending force delivery targets (fairness constraint).
+                        let hook_ready = self.hooks
                             .get(&(name.clone(), *cid))
                             .into_iter()
                             .flatten()
                             .any(|hook| {
                                 hook.current_decision().unwrap_or(false)
                                     || hook.can_make_nontrivial_decision()
-                            })
+                            });
+                        let has_force_target = force_delivery_targets
+                            .iter()
+                            .any(|(loc, c, _)| loc == name && c == cid);
+                        hook_ready || has_force_target
                     });
 
                 self.possibly_ready_observation = ready_obs;
@@ -1283,6 +1303,71 @@ impl<W: std::io::Write> LaunchedSim<W> {
                     // Signal quiescence and wait for new input.
                     self.quiescence.wait_for_resume().await;
                 } else {
+                    // Run lasso detection before making any scheduling decision.
+                    // Skip if we already have pending force delivery targets.
+                    let any_fairness_subject = self.hooks.values()
+                        .flatten()
+                        .any(|h| h.is_fairness_subject());
+                    if any_fairness_subject && force_delivery_targets.is_empty() {
+                        match lasso_detector.step(&self.hooks) {
+                            LassoResult::ForceDelivery(starved) => {
+                                force_delivery_targets = starved;
+                            }
+                            LassoResult::LivenessViolation | LassoResult::Truncated => {
+                                // Declare quiescence — the test will fail if liveness expected
+                                self.quiescence.wait_for_resume().await;
+                                continue;
+                            }
+                            LassoResult::Continue => {}
+                        }
+                    }
+
+                    // If force_delivery_targets is non-empty, check if any forced
+                    // observation is now ready and resolve it immediately.
+                    if !force_delivery_targets.is_empty() {
+                        let forced_keys: Vec<(LocationId, Option<u32>)> = force_delivery_targets
+                            .iter()
+                            .map(|(loc, cid, _)| (loc.clone(), *cid))
+                            .collect();
+
+                        // Check in possibly_ready_observation (already passed readiness check)
+                        if let Some(forced_obs_idx) = self.possibly_ready_observation.iter().position(|(loc, cid)| {
+                            forced_keys.contains(&(loc.clone(), *cid))
+                        }) {
+                            let obs_key = self.possibly_ready_observation[forced_obs_idx].clone();
+
+                            let force_indices: Vec<usize> = force_delivery_targets
+                                .iter()
+                                .filter(|(loc, cid, _)| *loc == obs_key.0 && *cid == obs_key.1)
+                                .map(|(_, _, idx)| *idx)
+                                .collect();
+
+                            let mut default_hooks = vec![];
+                            let hooks = self
+                                .hooks
+                                .get_mut(&obs_key)
+                                .unwrap_or(&mut default_hooks);
+
+                            run_hooks_with_force(&mut self.log, hooks, &force_indices);
+
+                            // Record deliveries from fairness-subject hooks
+                            for (i, hook) in hooks.iter().enumerate() {
+                                if hook.is_fairness_subject() && hook.current_decision() == Some(true) {
+                                    lasso_detector.record_delivery(&obs_key.0, obs_key.1, i);
+                                }
+                            }
+
+                            // Clear force targets that were just applied
+                            force_delivery_targets.retain(|(loc, cid, _)| {
+                                !(*loc == obs_key.0 && *cid == obs_key.1)
+                            });
+
+                            // Reset lasso detector after successful force delivery
+                            lasso_detector = LassoDetector::new(200);
+                            continue; // Go back to run async DFIRs
+                        }
+                    }
+
                     let next_tick_or_obs = (0..(self.possibly_ready_ticks.len()
                         + self.possibly_ready_observation.len()))
                         .any();
@@ -1290,6 +1375,14 @@ impl<W: std::io::Write> LaunchedSim<W> {
                     if next_tick_or_obs < self.possibly_ready_ticks.len() {
                         let next_tick = next_tick_or_obs;
                         let mut removed = self.possibly_ready_ticks.remove(next_tick);
+
+                        // Determine which hook indices should be forced (from lasso detection)
+                        let tick_key = (removed.0.clone(), removed.1);
+                        let tick_force_indices: Vec<usize> = force_delivery_targets
+                            .iter()
+                            .filter(|(loc, cid, _)| *loc == tick_key.0 && *cid == tick_key.1)
+                            .map(|(_, _, idx)| *idx)
+                            .collect();
 
                         match &mut self.log {
                             LogKind::Null => {}
@@ -1329,14 +1422,19 @@ impl<W: std::io::Write> LaunchedSim<W> {
                             });
 
                         let hooks = self.hooks.get_mut(&(removed.0.clone(), removed.1)).unwrap();
-                        run_hooks(&mut tick_decision_writer, hooks);
+                        run_hooks_with_force(&mut tick_decision_writer, hooks, &tick_force_indices);
 
-                        // Record deliveries from lossy hooks for fairness tracking
+                        // Record deliveries from fairness-subject hooks for fairness tracking
                         for (i, hook) in hooks.iter().enumerate() {
-                            if hook.is_lossy() && hook.current_decision() == Some(true) {
+                            if hook.is_fairness_subject() && hook.current_decision() == Some(true) {
                                 lasso_detector.record_delivery(&removed.0, removed.1, i);
                             }
                         }
+
+                        // Clear force targets that were just applied
+                        force_delivery_targets.retain(|(loc, cid, _)| {
+                            !(*loc == tick_key.0 && *cid == tick_key.1)
+                        });
 
                         let run_tick_future = removed.2.run_tick();
                         if let Some(inline_hooks) =
@@ -1375,24 +1473,6 @@ impl<W: std::io::Write> LaunchedSim<W> {
                         let next_obs = next_tick_or_obs - self.possibly_ready_ticks.len();
                         let obs_key = self.possibly_ready_observation[next_obs].clone();
 
-                        // Run lasso detection before resolving lossy observations
-                        let has_lossy = self.hooks.get(&obs_key)
-                            .map(|hs| hs.iter().any(|h| h.is_lossy() && h.can_make_nontrivial_decision()))
-                            .unwrap_or(false);
-                        if has_lossy {
-                            match lasso_detector.step(&self.hooks) {
-                                LassoResult::ForceDelivery(starved) => {
-                                    force_delivery_targets = starved;
-                                }
-                                LassoResult::LivenessViolation | LassoResult::Truncated => {
-                                    // Declare quiescence — the test will fail if liveness expected
-                                    self.quiescence.wait_for_resume().await;
-                                    continue;
-                                }
-                                LassoResult::Continue => {}
-                            }
-                        }
-
                         // Determine which hook indices should be forced (from lasso detection)
                         let force_indices: Vec<usize> = force_delivery_targets
                             .iter()
@@ -1408,9 +1488,9 @@ impl<W: std::io::Write> LaunchedSim<W> {
 
                         run_hooks_with_force(&mut self.log, hooks, &force_indices);
 
-                        // Record deliveries from lossy hooks for fairness tracking
+                        // Record deliveries from fairness-subject hooks for fairness tracking
                         for (i, hook) in hooks.iter().enumerate() {
-                            if hook.is_lossy() && hook.current_decision() == Some(true) {
+                            if hook.is_fairness_subject() && hook.current_decision() == Some(true) {
                                 lasso_detector.record_delivery(&obs_key.0, obs_key.1, i);
                             }
                         }
@@ -1426,10 +1506,6 @@ impl<W: std::io::Write> LaunchedSim<W> {
     }
 }
 
-fn run_hooks(tick_decision_writer: &mut impl std::fmt::Write, hooks: &mut Vec<Box<dyn SimHook>>) {
-    run_hooks_with_force(tick_decision_writer, hooks, &[])
-}
-
 /// Run hooks, optionally forcing specific hook indices to deliver.
 /// Lossy hooks are exempt from the default "must make at least one nontrivial decision"
 /// constraint unless they appear in `force_indices`.
@@ -1440,13 +1516,13 @@ fn run_hooks_with_force(
 ) {
     let mut made_nontrivial_decision = false;
 
-    // Pre-compute which hooks are lossy and which can make nontrivial decisions
-    let hook_is_lossy: Vec<bool> = hooks.iter().map(|h| h.is_lossy()).collect();
-    let non_lossy_undecided: Vec<bool> = hooks
+    // Pre-compute which hooks are fairness-subject and which can make nontrivial decisions
+    let hook_is_fairness_subject: Vec<bool> = hooks.iter().map(|h| h.is_fairness_subject()).collect();
+    let non_fairness_undecided: Vec<bool> = hooks
         .iter()
-        .map(|h| !h.is_lossy() && h.current_decision().is_none() && h.can_make_nontrivial_decision())
+        .map(|h| !h.is_fairness_subject() && h.current_decision().is_none() && h.can_make_nontrivial_decision())
         .collect();
-    let total_non_lossy_undecided: usize = non_lossy_undecided.iter().filter(|&&b| b).count();
+    let total_non_fairness_undecided: usize = non_fairness_undecided.iter().filter(|&&b| b).count();
 
     bolero::generator::bolero_generator::any::scope::borrow_with(|driver| {
         // first, scan manual decisions
@@ -1461,21 +1537,21 @@ fn run_hooks_with_force(
             }
         });
 
-        let mut non_lossy_remaining = total_non_lossy_undecided;
+        let mut non_fairness_remaining = total_non_fairness_undecided;
         hooks.iter_mut().enumerate().for_each(|(idx, hook)| {
             if hook.current_decision().is_none() {
                 let force = if force_indices.contains(&idx) {
-                    // Lasso detector is forcing this lossy hook to deliver
+                    // Lasso detector is forcing this fairness-subject hook to deliver/fire
                     true
-                } else if hook_is_lossy[idx] {
-                    // Lossy hooks are never forced by the default constraint
+                } else if hook_is_fairness_subject[idx] {
+                    // Fairness-subject hooks are never forced by the default constraint
                     false
                 } else {
-                    // Non-lossy hooks: force the last undecided one if no nontrivial decision yet
-                    if non_lossy_undecided[idx] {
-                        non_lossy_remaining -= 1;
+                    // Non-fairness hooks: force the last undecided one if no nontrivial decision yet
+                    if non_fairness_undecided[idx] {
+                        non_fairness_remaining -= 1;
                     }
-                    !made_nontrivial_decision && non_lossy_undecided[idx] && non_lossy_remaining == 0
+                    !made_nontrivial_decision && non_fairness_undecided[idx] && non_fairness_remaining == 0
                 };
                 made_nontrivial_decision |= hook.autonomous_decision(driver, force);
             }
