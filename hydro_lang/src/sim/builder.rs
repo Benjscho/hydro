@@ -193,6 +193,7 @@ impl DfirBuilder for SimBuilder {
                                 batch_location: (#batch_location, #line, #caret),
                                 format_item_debug: #root::__maybe_debug__!(#element_type),
                                 lossy: false,
+                                is_interval: false,
                                 _order: std::marker::PhantomData,
                             })
                         ),
@@ -1267,6 +1268,7 @@ impl DfirBuilder for SimBuilder {
                                 batch_location: ("lossy network", "", ""),
                                 format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
                                 lossy: true,
+                                is_interval: false,
                                 _order: std::marker::PhantomData,
                             })
                         ),
@@ -1349,6 +1351,7 @@ impl DfirBuilder for SimBuilder {
                                 batch_location: ("lossy network", "", ""),
                                 format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
                                 lossy: true,
+                                is_interval: false,
                                 _order: std::marker::PhantomData,
                             })
                         ),
@@ -1447,6 +1450,7 @@ impl DfirBuilder for SimBuilder {
                                 batch_location: ("lossy network", "", ""),
                                 format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
                                 lossy: true,
+                                is_interval: false,
                                 _order: std::marker::PhantomData,
                             })
                         ),
@@ -1552,6 +1556,7 @@ impl DfirBuilder for SimBuilder {
                                 batch_location: ("lossy network", "", ""),
                                 format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
                                 lossy: true,
+                                is_interval: false,
                                 _order: std::marker::PhantomData,
                             })
                         ),
@@ -2038,6 +2043,55 @@ impl DfirBuilder for SimBuilder {
         );
 
         Some(out_ident)
+    }
+
+    fn emit_interval_source(
+        &mut self,
+        location: &LocationId,
+        _duration_expr: &DebugExpr,
+        out_ident: &syn::Ident,
+    ) {
+        // In the sim, intervals are non-deterministic events subject to weak fairness.
+        // The duration is ignored (Layer 2: relative time). The IntervalHook
+        // non-deterministically fires or doesn't fire each step, and the lasso
+        // detector forces it to fire if the system is cycling without progress.
+        let root = get_this_crate();
+
+        let hoff_id = self.next_hoff_id;
+        self.next_hoff_id += 1;
+
+        let hoff_send_ident =
+            syn::Ident::new(&format!("__hoff_send_{hoff_id}"), Span::call_site());
+        let hoff_recv_ident =
+            syn::Ident::new(&format!("__hoff_recv_{hoff_id}"), Span::call_site());
+
+        self.add_extra_stmt_internal(location, syn::parse_quote! {
+            let (#hoff_send_ident, #hoff_recv_ident) = __root_dfir_rs::util::unbounded_channel::<()>();
+        });
+
+        // Register the IntervalHook as an observation hook for this location.
+        // It will be resolved by the scheduler when the location is "possibly ready."
+        self.add_hook(
+            location,
+            location,
+            syn::parse_quote!(
+                Box::new(#root::sim::runtime::IntervalHook {
+                    output: #hoff_send_ident,
+                    batch_location: ("interval source", "", ""),
+                    fired: None,
+                })
+            ),
+        );
+
+        // In the async DFIR, source the interval channel. Each `()` received
+        // represents one "tick" of the interval. Map to a dummy Instant.
+        self.get_dfir_mut(location).add_dfir(
+            parse_quote! {
+                #out_ident = source_stream(#hoff_recv_ident) -> map(|_| tokio::time::Instant::now());
+            },
+            None,
+            None,
+        );
     }
 }
 

@@ -1074,6 +1074,7 @@ impl HydroNode {
                     HydroSource::ExternalNetwork() => "external_network()".to_owned(),
                     HydroSource::Iter(expr) => format!("source_iter({})", expr),
                     HydroSource::Spin() => "spin()".to_owned(),
+                    HydroSource::Interval(expr) => format!("source_interval({})", expr),
                     HydroSource::ClusterMembers(location_id, _) => {
                         format!(
                             "source_stream(cluster_membership_stream({:?}))",

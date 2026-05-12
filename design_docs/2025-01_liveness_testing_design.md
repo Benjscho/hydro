@@ -111,7 +111,7 @@ Termination guarantee:
 
 ## Task Breakdown
 
-### Task 1: Mark hooks as lossy
+### Task 1: Mark hooks as lossy ✅ DONE
 
 **File**: `hydro_lang/src/sim/runtime.rs`
 
@@ -122,15 +122,15 @@ fn is_lossy(&self) -> bool { false }
 
 No new hook struct needed. `StreamHook` already supports releasing 0 items (a "drop"). The lossy flag tells the scheduler to apply fairness constraints.
 
-### Task 2: Wire up lossy network in SimBuilder
+### Task 2: Wire up lossy network in SimBuilder ✅ DONE
 
 **File**: `hydro_lang/src/sim/builder.rs`
 
-Replace the `todo!()` at line 1205 with the same wiring as `FailStop` (unbounded channel + `StreamHook`), but mark the resulting hook as lossy. The hook is registered with `is_lossy() = true`.
+Replace the `todo!()` with the same wiring as `FailStop` (unbounded channel + `StreamHook`), but mark the resulting hook as lossy. All four topology cases (P→P, C→P, P→C, C→C) are handled.
 
-### Task 3: State fingerprinting infrastructure
+### Task 3: State fingerprinting infrastructure ✅ DONE
 
-**File**: `hydro_lang/src/sim/compiled.rs` (new struct, possibly in a new file)
+**File**: `hydro_lang/src/sim/compiled.rs`
 
 ```rust
 struct StateFingerprint { pending_counts: u64, enabled_hooks: u64 }
@@ -142,32 +142,58 @@ struct LassoDetector {
 }
 
 struct FairnessRecord {
-    /// For each lossy hook index: did it deliver ≥1 item since last fingerprint?
-    delivered: Vec<bool>,
+    /// For each fairness-subject hook: did it deliver ≥1 item since last fingerprint?
+    delivered: HashMap<(LocationId, Option<u32>, usize), bool>,
+    /// For each fairness-subject hook: was it enabled (had pending items) at this step?
+    enabled: HashMap<(LocationId, Option<u32>, usize), bool>,
 }
 ```
 
-### Task 4: Lasso detection in scheduler loop
+### Task 4: Lasso detection in scheduler loop ✅ DONE
 
 **File**: `hydro_lang/src/sim/compiled.rs`
 
-After each round of hook resolution, if any lossy hook has pending items:
-1. Compute fingerprint
-2. Check for repeated fingerprint in trace
-3. If repeated: validate fairness of the cycle
-   - Unfair → set `force_nontrivial = true` on starved lossy hooks for next round
-   - Fair + hot → declare quiescence (liveness violation found)
-4. If max_steps exceeded → declare quiescence (truncate)
+Lasso detection now runs globally before each scheduling decision (not per-observation). After detecting a repeated fingerprint:
+1. Compute which hooks were enabled at any point during the cycle
+2. If all enabled hooks delivered → fair lasso → LivenessViolation
+3. If some enabled hooks never delivered → unfair lasso → ForceDelivery
+4. If max_steps exceeded → Truncated
 
-### Task 5: Enable liveness tests
+### Task 5: Enable liveness tests ⚠️ PARTIALLY DONE
 
 **File**: `hydro_lang/src/sim/tests/liveness.rs`
 
-Remove `#[ignore]` annotations from the three test functions.
+- `liveness_single_send_over_lossy_fails` — runs and passes ✅
+- `liveness_sample_every_over_lossy` — `#[ignore]`, blocked on scheduler issue
+- `liveness_retry_with_ack` — `#[ignore]`, blocked on scheduler issue
 
-### Task 6: `source_interval` in sim (prerequisite check)
+### Task 6: `source_interval` in sim ⚠️ PARTIALLY DONE
 
-Verify that `sample_every` / `source_interval` actually produces messages in the simulator. If it uses `tokio::time::interval`, ensure the sim runtime advances virtual time. If not working, this is a prerequisite blocker.
+**Design**: See `design_docs/2025-01_sample_every_in_sim.md`
+
+Sub-tasks:
+1. ✅ Add `HydroSource::Interval(DebugExpr)` to the IR
+2. ✅ Update `Location::source_interval` to emit it
+3. ✅ Update deploy builder to lower `Interval` to `IntervalStream` (preserves existing behavior)
+4. ✅ Sim builder: emit `IntervalHook` for `Interval` sources
+5. ✅ Add `is_interval` field to `StreamHook`, generalize `is_lossy()` → `is_fairness_subject()`
+6. ✅ Update lasso detector to use `is_fairness_subject()` instead of `is_lossy()`
+7. 🚫 Remove `#[ignore]` from liveness tests — **BLOCKED** on scheduler issue
+
+### Blocker: Lossy hook observation never becomes ready
+
+The lossy network hook is registered as an **observation** for the receiver's location. The scheduler's observation readiness check filters out observations whose hooks have no pending items. The lossy hook's buffer only gets items AFTER the sender's tick fires, but the readiness check runs BEFORE ticks fire (in the same scheduler iteration).
+
+**Sequence**:
+1. Readiness check → lossy hook empty → receiver's observation filtered out
+2. Scheduler picks sender's tick → tick fires → bytes sent to network channel
+3. Loop restarts → receiver's async DFIR picks up bytes → feeds into lossy buffer
+4. Readiness check → lossy hook NOW has items → receiver's observation IS ready
+5. But the exhaustive explorer also explores the branch where the sender's tick is picked again (step 2), creating an infinite cycle
+
+The lasso detector correctly identifies this as an unfair cycle and issues `ForceDelivery`. The force delivery mechanism keeps the targets persistent and resolves forced observations when they become ready. However, in the exhaustive exploration, there always exists a branch where the scheduler picks the sender's tick/observation instead of the forced receiver's observation, leading to the test failing.
+
+**Proposed fix**: Change the lossy hook from a standalone observation to part of the receiver's **tick** (similar to how batch hooks work). This would make the lossy hook resolve as part of the normal tick execution flow, eliminating the scheduling race. Alternatively, when `ForceDelivery` is active, prune all branches that don't resolve the forced observation (since those branches represent unfair executions that shouldn't be explored).
 
 ## Open Questions
 
@@ -175,6 +201,4 @@ Verify that `sample_every` / `source_interval` actually produces messages in the
 
 2. **Fingerprint precision**: Start with pending-count-only. Add message-content hashing only if false positives appear in practice.
 
-3. **`source_interval` in sim**: Does virtual time advance correctly? If not, Task 6 becomes a prerequisite implementation task.
-
-4. **Interaction with exhaustive search**: Forced delivery prunes unfair executions. This is semantically correct (unfair executions aren't valid counterexamples) and doesn't affect completeness.
+3. **Interaction with exhaustive search**: Forced delivery prunes unfair executions. This is semantically correct (unfair executions aren't valid counterexamples) and doesn't affect completeness.

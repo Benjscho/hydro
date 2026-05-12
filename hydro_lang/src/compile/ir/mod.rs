@@ -374,6 +374,7 @@ pub enum HydroSource {
     ExternalNetwork(),
     Iter(DebugExpr),
     Spin(),
+    Interval(DebugExpr),
     ClusterMembers(LocationId, ClusterMembersState),
     Embedded(#[serde(serialize_with = "serialize_ident")] syn::Ident),
     EmbeddedSingleton(#[serde(serialize_with = "serialize_ident")] syn::Ident),
@@ -495,6 +496,16 @@ pub trait DfirBuilder {
         in_kind: &CollectionKind,
         op_meta: &HydroIrOpMetadata,
     ) -> Option<syn::Ident>;
+
+    /// Emit a source for a periodic interval timer.
+    /// The deploy builder lowers this to `IntervalStream`; the sim builder emits a
+    /// self-replenishing hook subject to fairness constraints.
+    fn emit_interval_source(
+        &mut self,
+        location: &LocationId,
+        duration_expr: &DebugExpr,
+        out_ident: &syn::Ident,
+    );
 }
 
 #[cfg(feature = "build")]
@@ -761,6 +772,24 @@ impl DfirBuilder for SecondaryMap<LocationKey, FlatGraphBuilder> {
         _op_meta: &HydroIrOpMetadata,
     ) -> Option<syn::Ident> {
         None
+    }
+
+    fn emit_interval_source(
+        &mut self,
+        location: &LocationId,
+        duration_expr: &DebugExpr,
+        out_ident: &syn::Ident,
+    ) {
+        let builder = self.get_dfir_mut(location);
+        builder.add_dfir(
+            parse_quote! {
+                #out_ident = source_stream(tokio_stream::wrappers::IntervalStream::new(
+                    tokio::time::interval(#duration_expr)
+                ));
+            },
+            None,
+            None,
+        );
     }
 }
 
@@ -2996,6 +3025,22 @@ impl HydroNode {
                     } => {
                         if let HydroSource::ExternalNetwork() = source {
                             ident_stack.push(syn::Ident::new("DUMMY", Span::call_site()));
+                        } else if let HydroSource::Interval(duration_expr) = source {
+                            let source_ident =
+                                syn::Ident::new(&format!("stream_{}", *next_stmt_id), Span::call_site());
+                            debug_assert!(metadata.location_id.is_top_level());
+
+                            match builders_or_callback {
+                                BuildersOrCallback::Builders(graph_builders) => {
+                                    graph_builders.emit_interval_source(&out_location, duration_expr, &source_ident);
+                                }
+                                BuildersOrCallback::Callback(_, node_callback) => {
+                                    node_callback(node, next_stmt_id);
+                                }
+                            }
+
+                            *next_stmt_id += 1;
+                            ident_stack.push(source_ident);
                         } else {
                             let source_ident =
                                 syn::Ident::new(&format!("stream_{}", *next_stmt_id), Span::call_site());
@@ -3009,6 +3054,10 @@ impl HydroNode {
                                 }
 
                                 HydroSource::ExternalNetwork() => {
+                                    unreachable!()
+                                }
+
+                                HydroSource::Interval(_) => {
                                     unreachable!()
                                 }
 
@@ -4462,7 +4511,7 @@ impl HydroNode {
             }
             HydroNode::Cast { .. } | HydroNode::ObserveNonDet { .. } => {}
             HydroNode::Source { source, .. } => match source {
-                HydroSource::Stream(expr) | HydroSource::Iter(expr) => transform(expr),
+                HydroSource::Stream(expr) | HydroSource::Iter(expr) | HydroSource::Interval(expr) => transform(expr),
                 HydroSource::ExternalNetwork()
                 | HydroSource::Spin()
                 | HydroSource::ClusterMembers(_, _)

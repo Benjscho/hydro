@@ -1227,10 +1227,21 @@ pub trait Location<'a>: dynamic::DynLocation {
     where
         Self: Sized + NoTick,
     {
-        self.source_stream(q!(tokio_stream::StreamExt::map(
-            tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(interval)),
-            |_| ()
-        )))
+        let e = interval.splice_untyped_ctx(self);
+
+        Stream::new(
+            self.clone(),
+            HydroNode::Source {
+                source: HydroSource::Interval(e.into()),
+                metadata: self.new_node_metadata(Stream::<
+                    (),
+                    Self,
+                    Unbounded,
+                    TotalOrder,
+                    ExactlyOnce,
+                >::collection_kind()),
+            },
+        )
     }
 
     /// Generates a stream that emits `()` at a fixed interval, after an

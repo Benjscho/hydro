@@ -82,6 +82,12 @@ pub trait SimHook {
         false
     }
 
+    /// Whether this hook is subject to weak fairness constraints.
+    /// Covers both lossy network hooks and interval/timer hooks.
+    fn is_fairness_subject(&self) -> bool {
+        self.is_lossy()
+    }
+
     /// Returns the number of pending items in this hook's buffer.
     /// Used by the lasso detector to compute state fingerprints.
     fn pending_count(&self) -> usize {
@@ -194,6 +200,7 @@ pub struct StreamHook<T, Order: Ordering> {
     pub batch_location: HookLocationMeta,
     pub format_item_debug: fn(&T) -> Option<String>,
     pub lossy: bool,
+    pub is_interval: bool,
     pub _order: std::marker::PhantomData<Order>,
 }
 
@@ -208,6 +215,10 @@ impl<T> SimHook for StreamHook<T, TotalOrder> {
 
     fn is_lossy(&self) -> bool {
         self.lossy
+    }
+
+    fn is_fairness_subject(&self) -> bool {
+        self.lossy || self.is_interval
     }
 
     fn pending_count(&self) -> usize {
@@ -305,6 +316,10 @@ impl<T> SimHook for StreamHook<T, NoOrder> {
         self.lossy
     }
 
+    fn is_fairness_subject(&self) -> bool {
+        self.lossy || self.is_interval
+    }
+
     fn pending_count(&self) -> usize {
         self.input.borrow().len()
     }
@@ -396,6 +411,82 @@ impl<T> SimHook for StreamHook<T, NoOrder> {
 
             for item in to_release {
                 self.output.send(item).unwrap();
+            }
+        } else {
+            panic!("No decision to release");
+        }
+    }
+}
+
+/// A hook representing a periodic interval/timer source in the simulator.
+///
+/// Unlike `StreamHook`, this hook is always "enabled" (time can always advance)
+/// and non-deterministically fires or doesn't fire each step. It is subject to
+/// weak fairness: the lasso detector will force it to fire if the system is
+/// cycling without progress.
+pub struct IntervalHook {
+    pub output: UnboundedSender<()>,
+    pub batch_location: HookLocationMeta,
+    pub fired: Option<bool>,
+}
+
+impl SimHook for IntervalHook {
+    fn current_decision(&self) -> Option<bool> {
+        self.fired
+    }
+
+    fn can_make_nontrivial_decision(&self) -> bool {
+        true // interval can always fire (time can always advance)
+    }
+
+    fn is_fairness_subject(&self) -> bool {
+        true
+    }
+
+    fn pending_count(&self) -> usize {
+        1 // always has a "pending tick"
+    }
+
+    fn autonomous_decision<'a>(
+        &mut self,
+        driver: &mut Borrowed<'a>,
+        force_nontrivial: bool,
+    ) -> bool {
+        let fire = if force_nontrivial {
+            true
+        } else {
+            (0..=1usize).generate(driver).unwrap() == 1
+        };
+        self.fired = Some(fire);
+        fire
+    }
+
+    fn release_decision(&mut self, log_writer: &mut dyn std::fmt::Write) {
+        if let Some(fire) = self.fired.take() {
+            let (batch_location, line, caret_indent) = self.batch_location;
+            let note_str = if fire {
+                "^ interval fired"
+            } else {
+                "^ interval did not fire"
+            };
+
+            let _ = writeln!(
+                log_writer,
+                "{} {}",
+                "-->".color(colored::Color::Blue),
+                batch_location
+            );
+            let _ = writeln!(log_writer, " {}{}", "|".color(colored::Color::Blue), line);
+            let _ = writeln!(
+                log_writer,
+                " {}{}{}",
+                "|".color(colored::Color::Blue),
+                caret_indent,
+                note_str.color(colored::Color::Green)
+            );
+
+            if fire {
+                self.output.send(()).unwrap();
             }
         } else {
             panic!("No decision to release");
