@@ -141,7 +141,6 @@ pub fn compute_throughput_latency<'a, Client: 'a>(
 ) -> BenchResult<Cluster<'a, Client>> {
     let punctuation = clients.source_interval(
         q!(Duration::from_millis(interval_millis)),
-        nondet_measurement_window,
     );
 
     let (interval_throughput, interval_latency) = sliced! {
@@ -209,7 +208,6 @@ pub fn aggregate_bench_results<'a, Client: 'a, Aggregator>(
     let nondet_sampling = nondet!(/** non-deterministic samping only affects logging */);
     let punctuation = aggregator.source_interval(
         q!(Duration::from_millis(output_interval_millis)),
-        nondet_sampling,
     );
 
     let a_throughputs = results
