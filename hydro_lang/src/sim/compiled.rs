@@ -214,6 +214,10 @@ impl CompiledSim {
 
             self.with_instantiator(
                 |instantiator| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+
                     bolero::test(bolero::TargetLocation {
                         package_name: "",
                         manifest_dir: "",
@@ -239,10 +243,7 @@ impl CompiledSim {
                             instance.log = true;
                         }
 
-                        tokio::runtime::Builder::new_current_thread()
-                            .build()
-                            .unwrap()
-                            .block_on(async { instance.run(&mut thunk).await })
+                        rt.block_on(async { instance.run(&mut thunk).await })
                     })
                 },
                 false,
@@ -260,6 +261,10 @@ impl CompiledSim {
             );
             self.with_instantiator(
                 |instantiator| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+
                     bolero::test(bolero::TargetLocation {
                         package_name: "",
                         manifest_dir: "",
@@ -272,10 +277,7 @@ impl CompiledSim {
                     .with_iterations(self.unit_test_fuzz_iterations)
                     .run(move || {
                         let instance = instantiator();
-                        tokio::runtime::Builder::new_current_thread()
-                            .build()
-                            .unwrap()
-                            .block_on(async { instance.run(&mut thunk).await })
+                        rt.block_on(async { instance.run(&mut thunk).await })
                     })
                 },
                 false,
@@ -329,6 +331,10 @@ impl CompiledSim {
 
         self.with_instantiator(
             |instantiator| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+
                 bolero::test(bolero::TargetLocation {
                     package_name: "",
                     manifest_dir: "",
@@ -356,10 +362,7 @@ impl CompiledSim {
                         instance.log = true;
                     }
 
-                    tokio::runtime::Builder::new_current_thread()
-                        .build()
-                        .unwrap()
-                        .block_on(async { instance.run(&mut thunk).await })
+                    rt.block_on(async { instance.run(&mut thunk).await })
                 })
             },
             false,
@@ -1060,26 +1063,30 @@ impl<W: std::io::Write> LaunchedSim<W> {
             for (loc, c_id, dfir) in &mut self.async_dfirs {
                 if dfir.run_tick().await {
                     any_made_progress = true;
-                    let (now_ready, still_not_ready): (Vec<_>, Vec<_>) = self
-                        .not_ready_ticks
-                        .drain(..)
-                        .partition(|(tick_loc, tick_c_id, _)| {
-                            let LocationId::Tick(_, outer) = tick_loc else {
-                                unreachable!()
-                            };
-                            outer.as_ref() == loc && tick_c_id == c_id
-                        });
+                    let mut i = 0;
+                    while i < self.not_ready_ticks.len() {
+                        let (tick_loc, tick_c_id, _) = &self.not_ready_ticks[i];
+                        let LocationId::Tick(_, outer) = tick_loc else {
+                            unreachable!()
+                        };
+                        if outer.as_ref() == loc && tick_c_id == c_id {
+                            let item = self.not_ready_ticks.swap_remove(i);
+                            self.possibly_ready_ticks.push(item);
+                        } else {
+                            i += 1;
+                        }
+                    }
 
-                    self.possibly_ready_ticks.extend(now_ready);
-                    self.not_ready_ticks.extend(still_not_ready);
-
-                    let (now_ready_obs, still_not_ready_obs): (Vec<_>, Vec<_>) = self
-                        .not_ready_observation
-                        .drain(..)
-                        .partition(|(obs_loc, obs_c_id)| obs_loc == loc && obs_c_id == c_id);
-
-                    self.possibly_ready_observation.extend(now_ready_obs);
-                    self.not_ready_observation.extend(still_not_ready_obs);
+                    let mut i = 0;
+                    while i < self.not_ready_observation.len() {
+                        let (obs_loc, obs_c_id) = &self.not_ready_observation[i];
+                        if obs_loc == loc && obs_c_id == c_id {
+                            let item = self.not_ready_observation.swap_remove(i);
+                            self.possibly_ready_observation.push(item);
+                        } else {
+                            i += 1;
+                        }
+                    }
                 }
             }
 
@@ -1088,39 +1095,42 @@ impl<W: std::io::Write> LaunchedSim<W> {
             } else {
                 use bolero::generator::*;
 
-                let (ready_tick, mut not_ready_tick): (Vec<_>, Vec<_>) = self
-                    .possibly_ready_ticks
-                    .drain(..)
-                    .partition(|(name, cid, _)| {
-                        let hooks = self.hooks.get(&(name.clone(), *cid)).unwrap();
-                        // All hooks must be ready (have received input or have a last value)
-                        hooks.iter().all(|hook| hook.is_ready())
-                            // And at least one hook must be able to make progress
-                            && hooks.iter().any(|hook| {
-                                hook.current_decision().unwrap_or(false)
-                                    || hook.can_make_nontrivial_decision()
-                            })
-                    });
+                let mut i = 0;
+                while i < self.possibly_ready_ticks.len() {
+                    let (name, cid, _) = &self.possibly_ready_ticks[i];
+                    let hooks = self.hooks.get(&(name.clone(), *cid)).unwrap();
+                    let is_ready = hooks.iter().all(|hook| hook.is_ready())
+                        && hooks.iter().any(|hook| {
+                            hook.current_decision().unwrap_or(false)
+                                || hook.can_make_nontrivial_decision()
+                        });
+                    if !is_ready {
+                        let item = self.possibly_ready_ticks.swap_remove(i);
+                        self.not_ready_ticks.push(item);
+                    } else {
+                        i += 1;
+                    }
+                }
 
-                self.possibly_ready_ticks = ready_tick;
-                self.not_ready_ticks.append(&mut not_ready_tick);
-
-                let (ready_obs, mut not_ready_obs): (Vec<_>, Vec<_>) = self
-                    .possibly_ready_observation
-                    .drain(..)
-                    .partition(|(name, cid)| {
-                        self.hooks
-                            .get(&(name.clone(), *cid))
-                            .into_iter()
-                            .flatten()
-                            .any(|hook| {
-                                hook.current_decision().unwrap_or(false)
-                                    || hook.can_make_nontrivial_decision()
-                            })
-                    });
-
-                self.possibly_ready_observation = ready_obs;
-                self.not_ready_observation.append(&mut not_ready_obs);
+                let mut i = 0;
+                while i < self.possibly_ready_observation.len() {
+                    let (name, cid) = &self.possibly_ready_observation[i];
+                    let is_ready = self
+                        .hooks
+                        .get(&(name.clone(), *cid))
+                        .into_iter()
+                        .flatten()
+                        .any(|hook| {
+                            hook.current_decision().unwrap_or(false)
+                                || hook.can_make_nontrivial_decision()
+                        });
+                    if !is_ready {
+                        let item = self.possibly_ready_observation.swap_remove(i);
+                        self.not_ready_observation.push(item);
+                    } else {
+                        i += 1;
+                    }
+                }
 
                 if self.possibly_ready_ticks.is_empty()
                     && self.possibly_ready_observation.is_empty()
@@ -1144,7 +1154,7 @@ impl<W: std::io::Write> LaunchedSim<W> {
 
                     if next_tick_or_obs < self.possibly_ready_ticks.len() {
                         let next_tick = next_tick_or_obs;
-                        let mut removed = self.possibly_ready_ticks.remove(next_tick);
+                        let mut removed = self.possibly_ready_ticks.swap_remove(next_tick);
 
                         match &mut self.log {
                             LogKind::Null => {}

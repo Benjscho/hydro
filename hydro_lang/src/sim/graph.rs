@@ -427,16 +427,56 @@ impl<'a> Deploy<'a> for SimDeploy {
 }
 
 pub(super) fn compile_sim(bin: String, trybuild: TrybuildConfig) -> Result<TempPath, ()> {
-    let mut command = Command::new("cargo");
+    // Check if a cached dylib already exists for this hash.
+    // The cache is keyed by the hash of the generated source AND the mtime of the
+    // dylib-examples crate's compiled dependencies. We use the target dir's dep-info
+    // as a proxy: if any dependency was recompiled, cargo will have updated files in
+    // the target dir that are newer than our cache entry.
+    let cache_dir = path!(trybuild.target_dir / "hydro_sim_cache");
+    fs::create_dir_all(&cache_dir).ok();
+
+    let dylib_ext = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    let cached_path = path!(cache_dir / format!("{bin}.{dylib_ext}"));
 
     let is_fuzz = std::env::var("BOLERO_FUZZER").is_ok();
 
-    // Run from dylib-examples crate which has the dylib as a dev-dependency (only if not fuzzing)
+    // The source file for this example - if it exists and the cache is newer, we can skip.
     let crate_to_compile = if is_fuzz {
         trybuild.project_dir.clone()
     } else {
         path!(trybuild.project_dir / "dylib-examples")
     };
+
+    // Use the deps directory mtime as the invalidation signal.
+    // When any dependency is recompiled, cargo updates files in deps/.
+    let deps_dir = path!(trybuild.target_dir / "debug" / "deps");
+
+    if cached_path.exists() {
+        let cache_mtime = fs::metadata(&cached_path)
+            .and_then(|m| m.modified())
+            .ok();
+        let deps_mtime = fs::metadata(&deps_dir)
+            .and_then(|m| m.modified())
+            .ok();
+
+        let cache_valid = cache_mtime.is_some_and(|cache_t| {
+            deps_mtime.is_none_or(|deps_t| cache_t >= deps_t)
+        });
+
+        if cache_valid {
+            let out_file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+            fs::copy(&cached_path, &out_file).unwrap();
+            return Ok(out_file);
+        }
+    }
+
+    let mut command = Command::new("cargo");
+
+    // Run from dylib-examples crate which has the dylib as a dev-dependency (only if not fuzzing)
     command.current_dir(&crate_to_compile);
     command.args(["rustc", "--locked"]);
     command.args(["--example", "sim-dylib"]);
@@ -542,6 +582,10 @@ pub(super) fn compile_sim(bin: String, trybuild: TrybuildConfig) -> Result<TempP
 
     let out_file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
     fs::copy(out.as_ref().unwrap(), &out_file).unwrap();
+
+    // Cache the compiled dylib for future runs
+    fs::copy(out.as_ref().unwrap(), &cached_path).ok();
+
     Ok(out_file)
 }
 
