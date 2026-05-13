@@ -1381,14 +1381,15 @@ impl<W: std::io::Write> LaunchedSim<W> {
                                 !(*loc == obs_key.0 && *cid == obs_key.1)
                             });
 
-                            // Reset lasso detector after successful force delivery
-                            lasso_detector = LassoDetector::new(self.max_lasso_steps);
+                            // Don't reset lasso detector — if the system cycles again,
+                            // the lasso will detect it as a fair lasso (all hooks delivered)
+                            // and declare quiescence, allowing the test to check assertions.
                             continue; // Go back to run async DFIRs
                         }
 
                         // Forced observation not ready yet — deterministically run
-                        // a tick to feed data to it. Skip any() branching to prune
-                        // unfair executions that would never resolve the forced target.
+                        // a tick or resolve another observation to feed data to it.
+                        // Skip any() branching to prune unfair executions.
                         if !self.possibly_ready_ticks.is_empty() {
                             // Pick the first ready tick deterministically (no branching)
                             let next_tick_or_obs = 0;
@@ -1488,7 +1489,42 @@ impl<W: std::io::Write> LaunchedSim<W> {
                             continue; // Go back to run async DFIRs to propagate data
                         }
 
-                        // No ticks ready either — the forced observation may need
+                        // No ticks ready — try resolving another (non-forced) observation
+                        // to feed data to the forced one (e.g., fire an interval to produce items).
+                        let other_obs_idx = self.possibly_ready_observation.iter().position(|(loc, cid)| {
+                            !forced_keys.contains(&(loc.clone(), *cid))
+                                && self.hooks
+                                    .get(&(loc.clone(), *cid))
+                                    .into_iter()
+                                    .flatten()
+                                    .any(|hook| hook.can_make_nontrivial_decision())
+                        });
+
+                        if let Some(other_idx) = other_obs_idx {
+                            let obs_key = self.possibly_ready_observation[other_idx].clone();
+                            let hooks = self.hooks.get_mut(&obs_key).unwrap();
+
+                            // Force all fairness-subject hooks in this observation to fire
+                            let obs_force_indices: Vec<usize> = hooks
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, h)| h.is_fairness_subject())
+                                .map(|(i, _)| i)
+                                .collect();
+
+                            run_hooks_with_force(&mut self.log, hooks, &obs_force_indices);
+
+                            // Record deliveries
+                            for (i, hook) in hooks.iter().enumerate() {
+                                if hook.is_fairness_subject() && hook.current_decision() == Some(true) {
+                                    lasso_detector.record_delivery(&obs_key.0, obs_key.1, i);
+                                }
+                            }
+
+                            continue; // Go back to run async DFIRs to propagate data
+                        }
+
+                        // No ticks or observations ready — the forced observation may need
                         // async DFIR progress. Continue the loop to let DFIRs run.
                         continue;
                     }

@@ -1,197 +1,150 @@
-# Liveness Testing: Design Doc
+# Liveness Testing: Design & Implementation
 
 ## Summary
 
-Add liveness testing to the Hydro simulator by implementing lossy network channels with fairness-based lasso detection. The simulator detects when the system is cycling without progress and forces message delivery to break the cycle, guaranteeing termination for protocols that retry.
+The Hydro simulator supports liveness testing via lossy network channels with fairness-based lasso detection. The simulator detects when the system is cycling without progress and forces message delivery to break the cycle, guaranteeing termination for protocols that retry.
 
-## Background
+**Key files:**
+- `hydro_lang/src/sim/compiled.rs` — `LassoDetector`, `StateFingerprint`, scheduler loop
+- `hydro_lang/src/sim/runtime.rs` — `StreamHook` (lossy mode), `IntervalHook`
+- `hydro_lang/src/sim/builder.rs` — lossy network wiring, interval source emission
+- `hydro_lang/src/sim/tests/liveness.rs` — test suite
 
-The simulator currently supports two network fault models:
-- **`FailStop`**: Reliable delivery (direct unbounded channel)
-- **`LossyDelayedForever`**: Models drops as infinite delays, safety-only testing
+## How It Works
 
-The **`Lossy`** fault model (`TCP.lossy(nondet!(...))`) is declared in the type system but panics with `todo!()` in `builder.rs`. A naive implementation that allows dropping all packets would make any liveness assertion fail.
+### Core Mechanism
 
-## Design
+1. **Lossy hooks** (`StreamHook` with `lossy: true`) non-deterministically deliver or drop one message at a time (binary choice per item).
+2. **Interval hooks** (`IntervalHook`) non-deterministically fire or don't fire (binary choice).
+3. Both are **fairness subjects** — the lasso detector tracks whether they've delivered/fired.
+4. The **lasso detector** fingerprints the system state at each scheduling decision. When a fingerprint repeats:
+   - If all enabled fairness-subject hooks delivered during the cycle → **fair lasso** → declare quiescence (liveness violation if test assertion unsatisfied)
+   - If some enabled hooks never delivered → **unfair lasso** → force those hooks to deliver
+5. After force delivery, the lasso detector is **not reset**. On the next cycle, the same fingerprint appears with all hooks having delivered → fair lasso → quiescence. The test assertion is then checked.
 
-### Core Insight
+### State Fingerprinting
 
-Dropping another message doesn't change system behavior if the system state hasn't changed. If the sender will re-send the same value, dropping it again teaches us nothing new. The simulator should detect this cycling and force delivery.
+```rust
+struct StateFingerprint {
+    pending_counts: u64,  // hash of pending_count().min(1) per fairness-subject hook
+    enabled_hooks: u64,   // hash of can_make_nontrivial_decision() per hook
+}
+```
 
-### Fairness Model: Weak Fairness via Lasso Detection
+Using `min(1)` collapses buffer sizes ≥1 into the same abstract state, ensuring the fingerprint stabilizes quickly regardless of how many items accumulate.
 
-Adapted from TLA+ weak fairness (WF) and the P# cycle detection approach:
+### Lossy Hook Decision Model
 
-- **Weak fairness**: If a lossy hook is *continuously enabled* (has pending messages from a retrying sender), it must eventually deliver at least one message.
-- **Lasso**: A repeated state fingerprint indicating the system is cycling. A lasso is **fair** only if every continuously-enabled lossy hook delivered at least once during the cycle. An **unfair** lasso triggers forced delivery.
+The lossy `StreamHook` makes a **constant-branching** decision:
+- Drain exactly 1 item from the buffer
+- Binary choice: deliver it or drop it
 
-### How It Maps to Hydro's Simulator
+When `force_nontrivial = true` (lasso forcing delivery), all buffered items are delivered deterministically with no branching.
 
-| Concept | Hydro equivalent |
-|---------|-----------------|
-| State | Fold/singleton values + pending messages in all buffers |
-| Process | A hook that `can_make_nontrivial_decision()` |
-| Scheduled | Which hook was chosen to make a nontrivial decision |
-| Hot | Test assertion not yet satisfied |
-| Fair lasso | Cycle where every lossy hook with pending items delivered ≥1 |
+This keeps the exhaustive state space bounded. The previous design (drain 1..=N items, then deliver 0..=drained) created branching proportional to buffer size, causing state space explosion.
 
-### Algorithm
+### Force Delivery Flow
+
+When the lasso detects an unfair cycle:
+1. Set `force_delivery_targets` to the starved hooks
+2. If the forced observation has items → resolve immediately with forced delivery (all items delivered, no branching)
+3. If the forced observation's buffer is empty → deterministically resolve other observations (e.g., fire the IntervalHook) or run ticks to feed data to it
+4. After force delivery succeeds, do NOT reset the lasso detector
+5. On the next scheduling step, the fingerprint repeats → fair lasso (all hooks delivered) → quiescence declared
+6. Test assertion is checked; if the forced delivery satisfied it, the test passes
+
+### Scheduler Loop (simplified)
 
 ```
 loop {
-    run scheduler normally (pick hooks, make decisions, run ticks)
+    run all async DFIRs until no progress
 
-    if quiescent (no hook can make progress):
-        break  // normal termination
+    partition observations/ticks into ready vs not-ready
 
-    if lossy hooks exist with pending items:
-        compute fingerprint F = hash(pending_counts_per_hook, enabled_hooks)
-        if F seen before at position i:
-            cycle = trace[i..current]
-            if every lossy hook with pending items delivered ≥1 in cycle:
-                // Fair hot lasso → genuine liveness violation
-                break  // test will fail (assertion unsatisfied)
-            else:
-                // Unfair lasso → force starved hooks to deliver
-                set force_nontrivial on starved lossy hooks
-                continue
+    if nothing ready:
+        signal quiescence → test assertion checked
+        wait for new input (or end)
 
-    if steps > max_steps_bound:
-        break  // truncate (same as paper's bound B)
-}
+    if fairness-subject hooks exist and no pending force targets:
+        lasso_detector.step(hooks) → Continue | ForceDelivery | LivenessViolation | Truncated
+
+    if force_delivery_targets non-empty:
+        if forced observation has items → resolve with forced delivery
+        else → resolve other observations/ticks deterministically to feed data
+        continue
+
+    branch via any() → pick a tick or observation to resolve
+    resolve hooks (each makes autonomous decisions via driver)
+    continue
 ```
 
 ### Expected Behavior
 
 | Pattern | Result |
 |---------|--------|
-| `sample_every` + lossy send | PASS — retries feed the hook, unfair lasso detected, delivery forced |
+| `source_interval` + lossy send | PASS — interval feeds the hook, unfair lasso detected, delivery forced |
 | Single send + lossy (no retry) | FAIL — message dropped, buffer empties, normal quiescence, assertion unsatisfied |
 | Retry-with-ack + lossy | PASS — retries keep feeding, fairness forces delivery |
 
-### State Fingerprinting
+### Configuration
 
-Start with a minimal fingerprint (from P# partial-state caching):
+- `max_lasso_steps(n)` — maximum fingerprint trace length before truncation (default: 200). For simple liveness tests, 5 is sufficient. The lasso typically detects within 2-3 steps.
 
-```rust
-struct StateFingerprint {
-    /// Hash of: for each lossy hook, number of pending items
-    pending_counts: u64,
-    /// Hash of: which lossy hooks can_make_nontrivial_decision()
-    enabled_hooks: u64,
-}
-```
-
-This is cheap (O(num_hooks) per check) and sufficient for `sample_every` patterns. If false positives occur, add replay confirmation (attempt to replay the cycle's decisions; if replay diverges, discard the lasso).
-
-### Learnings from P# Implementation
-
-P# uses two complementary strategies. We adopt the more principled one (cycle detection) adapted to our hook-based scheduler:
-
-1. **Temperature checking** (simple heuristic): count steps a monitor stays "hot"; flag if threshold exceeded. Useful as a fallback but produces false positives.
-
-2. **Cycle detection** (what we implement): fingerprint state at each step, detect repeated fingerprints, validate fairness of the cycle, confirm via replay. This is sound under the assumption that same fingerprint = same state (with replay as confirmation).
-
-Key P# design choices we adopt:
-- **Safety prefix bound**: Skip initial steps before starting fingerprint collection (avoids initialization noise). Default: 0.
-- **Replay confirmation**: When a cycle candidate is found, replay it to confirm the system actually repeats. If replay diverges, discard.
-- **Fairness = all enabled processes scheduled**: In our case, "scheduled and delivered" for lossy hooks specifically (weak fairness on the deliver action, not just the schedule action).
-
-Key difference from P#: P# monitors are explicit state machines with hot/cold annotations. In Hydro, "hot" simply means the test assertion hasn't yielded expected values yet. No separate monitor infrastructure needed.
-
-### State Space Impact
-
-The lossy hook does NOT add new branching decisions to the exhaustive search. It reuses `StreamHook` with the same `(0..=N)` release range. New costs:
-- Computing fingerprints: O(num_hooks) per quiescence point
-- Storing trace: bounded by max_steps
-
-Termination guarantee:
-- Finite inputs (no `sample_every`): buffers eventually empty, same as today
-- Infinite inputs (`sample_every`): lasso detection triggers, either forcing delivery or declaring quiescence
-
-## Task Breakdown
-
-### Task 1: Mark hooks as lossy ✅ DONE
-
-**File**: `hydro_lang/src/sim/runtime.rs`
-
-Add to `SimHook` trait:
-```rust
-fn is_lossy(&self) -> bool { false }
-```
-
-No new hook struct needed. `StreamHook` already supports releasing 0 items (a "drop"). The lossy flag tells the scheduler to apply fairness constraints.
-
-### Task 2: Wire up lossy network in SimBuilder ✅ DONE
-
-**File**: `hydro_lang/src/sim/builder.rs`
-
-Replace the `todo!()` with the same wiring as `FailStop` (unbounded channel + `StreamHook`), but mark the resulting hook as lossy. All four topology cases (P→P, C→P, P→C, C→C) are handled.
-
-### Task 3: State fingerprinting infrastructure ✅ DONE
-
-**File**: `hydro_lang/src/sim/compiled.rs`
-
-```rust
-struct StateFingerprint { pending_counts: u64, enabled_hooks: u64 }
-
-struct LassoDetector {
-    trace: Vec<(StateFingerprint, FairnessRecord)>,
-    seen: HashMap<StateFingerprint, Vec<usize>>,
-    max_steps: usize,
-}
-
-struct FairnessRecord {
-    /// For each fairness-subject hook: did it deliver ≥1 item since last fingerprint?
-    delivered: HashMap<(LocationId, Option<u32>, usize), bool>,
-    /// For each fairness-subject hook: was it enabled (had pending items) at this step?
-    enabled: HashMap<(LocationId, Option<u32>, usize), bool>,
-}
-```
-
-### Task 4: Lasso detection in scheduler loop ✅ DONE
-
-**File**: `hydro_lang/src/sim/compiled.rs`
-
-Lasso detection now runs globally before each scheduling decision (not per-observation). After detecting a repeated fingerprint:
-1. Compute which hooks were enabled at any point during the cycle
-2. If all enabled hooks delivered → fair lasso → LivenessViolation
-3. If some enabled hooks never delivered → unfair lasso → ForceDelivery
-4. If max_steps exceeded → Truncated
-
-### Task 5: Enable liveness tests ✅ DONE
+## Test Suite
 
 **File**: `hydro_lang/src/sim/tests/liveness.rs`
 
-- `liveness_single_send_over_lossy_fails` — runs and passes ✅
-- `liveness_sample_every_over_lossy` — runs and passes ✅
-- `liveness_retry_with_ack` — runs and passes ✅
+- `liveness_single_send_over_lossy_fails` — `#[should_panic]`, verifies that a single send over lossy fails with "Stream ended early" (not a compilation error)
+- `liveness_sample_every_over_lossy` — `source_interval` → `map` → `send(lossy)`, asserts delivery via fairness
+- `liveness_retry_with_ack` — same pattern with different payload, demonstrates retry protocol
 
-### Task 6: `source_interval` in sim ✅ DONE
+All three tests complete in ~19s total (including trybuild compilation).
 
-**Design**: See `design_docs/2025-01_sample_every_in_sim.md`
+## Implementation Details
 
-Sub-tasks:
-1. ✅ Add `HydroSource::Interval(DebugExpr)` to the IR
-2. ✅ Update `Location::source_interval` to emit it
-3. ✅ Update deploy builder to lower `Interval` to `IntervalStream` (preserves existing behavior)
-4. ✅ Sim builder: emit `IntervalHook` for `Interval` sources
-5. ✅ Add `is_interval` field to `StreamHook`, generalize `is_lossy()` → `is_fairness_subject()`
-6. ✅ Update lasso detector to use `is_fairness_subject()` instead of `is_lossy()`
-7. ✅ Remove `#[ignore]` from liveness tests
+### Hooks and Fairness Subjects
 
-### Resolved: Lossy hook observation scheduling
+The `SimHook` trait has:
+- `is_fairness_subject()` — returns true for lossy `StreamHook`s and `IntervalHook`s
+- `pending_count()` — used by fingerprinting; `IntervalHook` always returns 1
+- `can_make_nontrivial_decision()` — `IntervalHook` always true; lossy `StreamHook` true when buffer non-empty
 
-The blocker was that when `ForceDelivery` was active, the exhaustive explorer still branched via `any()`, exploring paths where the forced observation never got resolved (the sender's tick was picked instead, creating an infinite exploration loop).
+### Lossy Network Wiring (SimBuilder)
 
-**Fix**: When `ForceDelivery` is active but the forced observation's buffer is empty (data hasn't flowed from sender yet), skip `any()` branching and deterministically run ticks with all fairness-subject hooks forced to fire. This feeds data to the forced observation without exploring unfair branches. Once the forced observation has items, resolve it immediately with forced delivery.
+For P→P lossy sends:
+- Sender's async DFIR serializes and sends to an unbounded channel
+- Receiver's async DFIR reads from the channel into a `VecDeque` buffer
+- A lossy `StreamHook` on the receiver's location controls release from the buffer
+- The hook is registered as a fairness subject
 
-This is semantically correct: unfair executions (where a continuously-enabled hook is starved) are not valid counterexamples to liveness properties, so pruning them doesn't affect completeness.
+### IntervalHook (source_interval in sim)
 
-## Open Questions
+- Duration is ignored (sim uses abstract time)
+- Creates an `IntervalHook` that non-deterministically fires or doesn't fire
+- When it fires, sends `()` to a channel that the async DFIR reads via `source_stream`
+- Marked as a fairness subject so the lasso forces it to fire if the system is cycling
 
-1. **Max-steps bound**: Default value for truncation. P# uses ~500 steps. Start with 200 and make configurable.
+### Key Design Decisions
 
-2. **Fingerprint precision**: Start with pending-count-only. Add message-content hashing only if false positives appear in practice.
+1. **No lasso reset after force delivery** — prevents infinite force-deliver-reset cycles. After delivery, the next cycle is detected as fair → quiescence.
+2. **Constant branching in lossy hooks** — drain 1 item, binary deliver/drop. Prevents state space explosion from buffer accumulation.
+3. **Resolve other observations during force delivery** — when the forced hook's buffer is empty, fire other hooks (e.g., IntervalHook) to feed data to it, rather than only handling ticks.
+4. **`pending_count().min(1)` in fingerprint** — abstracts buffer size to empty/non-empty, ensuring fingerprints stabilize quickly.
 
-3. **Interaction with exhaustive search**: Forced delivery prunes unfair executions. This is semantically correct (unfair executions aren't valid counterexamples) and doesn't affect completeness.
+## Resolved Issues
+
+### Compilation error in test (std::iter::once)
+
+`std::iter::once(123_u32)` produces type `core::iter::sources::once::Once<u32>` which references a private module in generated staged code. Fixed by using `vec![123_u32]` in `source_iter`.
+
+### State space explosion from lossy hook branching
+
+The original lossy hook drained `(1..=N)` items then delivered `(0..=drained)`, creating O(N²) branches. Fixed by draining exactly 1 item with a binary deliver/drop decision.
+
+### Infinite force-deliver-reset loop
+
+After force delivery, the lasso detector was reset. The interval would fire again, the lasso would detect again, force again, reset again — never reaching quiescence. Fixed by not resetting the detector; the next cycle is fair → quiescence declared.
+
+### Force delivery with empty buffer
+
+When the forced lossy hook's buffer was empty and there were no ticks to run, the scheduler looped without progress. Fixed by also resolving other observations (e.g., IntervalHook) to feed data to the forced hook.

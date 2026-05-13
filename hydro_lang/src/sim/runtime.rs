@@ -233,24 +233,26 @@ impl<T> SimHook for StreamHook<T, TotalOrder> {
         let mut current_input = self.input.borrow_mut();
 
         if self.lossy {
-            // Lossy mode: drain some items, then decide how many to actually deliver.
-            // Items drained but not delivered are permanently dropped.
+            // Lossy mode: decide whether to deliver or drop one item at a time.
+            // Items not delivered are permanently dropped.
             if current_input.is_empty() {
                 self.to_release = Some(vec![]);
                 return false;
             }
 
-            // Drain at least 1 item (to ensure progress), up to all items
-            let drain_count = (1..=current_input.len()).generate(driver).unwrap();
-            let drained: Vec<T> = current_input.drain(0..drain_count).collect();
+            if force_nontrivial {
+                // When forced by lasso detector, deliver all items deterministically.
+                let drained: Vec<T> = current_input.drain(..).collect();
+                self.to_release = Some(drained);
+                return true;
+            }
 
-            // Of the drained items, deliver 0..=drain_count
-            let deliver_count = ((if force_nontrivial { 1 } else { 0 })..=drained.len())
-                .generate(driver)
-                .unwrap();
+            // Drain exactly 1 item and decide: deliver (1) or drop (0).
+            let item = current_input.pop_front().unwrap();
+            let deliver: bool = (0..=1usize).generate(driver).unwrap() == 1;
 
-            self.to_release = Some(drained.into_iter().take(deliver_count).collect());
-            deliver_count > 0
+            self.to_release = Some(if deliver { vec![item] } else { vec![] });
+            deliver
         } else {
             let count = ((if force_nontrivial { 1 } else { 0 })..=current_input.len())
                 .generate(driver)
@@ -338,15 +340,19 @@ impl<T> SimHook for StreamHook<T, NoOrder> {
                 return false;
             }
 
-            let drain_count = (1..=current_input.len()).generate(driver).unwrap();
-            let drained: Vec<T> = current_input.drain(0..drain_count).collect();
+            if force_nontrivial {
+                // When forced by lasso detector, deliver all items deterministically.
+                let drained: Vec<T> = current_input.drain(..).collect();
+                self.to_release = Some(drained);
+                return true;
+            }
 
-            let deliver_count = ((if force_nontrivial { 1 } else { 0 })..=drained.len())
-                .generate(driver)
-                .unwrap();
+            // Drain exactly 1 item and decide: deliver (1) or drop (0).
+            let item = current_input.pop_front().unwrap();
+            let deliver: bool = (0..=1usize).generate(driver).unwrap() == 1;
 
-            self.to_release = Some(drained.into_iter().take(deliver_count).collect());
-            deliver_count > 0
+            self.to_release = Some(if deliver { vec![item] } else { vec![] });
+            deliver
         } else {
             let mut out = vec![];
             let mut min_index = 0;
