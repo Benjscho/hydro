@@ -506,6 +506,18 @@ pub trait DfirBuilder {
         duration_expr: &DebugExpr,
         out_ident: &syn::Ident,
     );
+
+    /// Emit a sample_every node that periodically samples a singleton.
+    /// The deploy builder lowers this to interval + cross_singleton; the sim builder
+    /// emits a single observation-level hook to avoid state space explosion.
+    fn emit_sample_every(
+        &mut self,
+        location: &LocationId,
+        input_ident: &syn::Ident,
+        interval_expr: &DebugExpr,
+        element_type: &syn::Type,
+        out_ident: &syn::Ident,
+    );
 }
 
 #[cfg(feature = "build")]
@@ -786,6 +798,37 @@ impl DfirBuilder for SecondaryMap<LocationKey, FlatGraphBuilder> {
                 #out_ident = source_stream(tokio_stream::wrappers::IntervalStream::new(
                     tokio::time::interval(#duration_expr)
                 ));
+            },
+            None,
+            None,
+        );
+    }
+
+    fn emit_sample_every(
+        &mut self,
+        location: &LocationId,
+        input_ident: &syn::Ident,
+        interval_expr: &DebugExpr,
+        _element_type: &syn::Type,
+        out_ident: &syn::Ident,
+    ) {
+        let builder = self.get_dfir_mut(location);
+        // In deploy mode, sample_every creates an interval that gates the singleton.
+        // The singleton value is passed through whenever the interval fires.
+        let interval_ident =
+            syn::Ident::new(&format!("{}_interval", out_ident), Span::call_site());
+        builder.add_dfir(
+            parse_quote! {
+                #interval_ident = source_stream(tokio_stream::wrappers::IntervalStream::new(
+                    tokio::time::interval(#interval_expr)
+                )) -> map(|_| ());
+            },
+            None,
+            None,
+        );
+        builder.add_dfir(
+            parse_quote! {
+                #out_ident = cross_singleton(#interval_ident, #input_ident) -> map(|(_, v)| v);
             },
             None,
             None,
@@ -2344,6 +2387,16 @@ pub enum HydroNode {
         input: Box<HydroNode>,
         metadata: HydroIrMetadata,
     },
+
+    /// Periodically samples a singleton value at a given interval, producing an unbounded stream.
+    /// In the simulator, this is handled as a single observation-level hook (no tick needed),
+    /// avoiding the state space explosion that would come from decomposing into
+    /// source_interval + sliced! block.
+    SampleEvery {
+        input: Box<HydroNode>,
+        interval: DebugExpr,
+        metadata: HydroIrMetadata,
+    },
 }
 
 pub type SeenSharedNodes = HashMap<*const RefCell<HydroNode>, Rc<RefCell<HydroNode>>>;
@@ -2491,7 +2544,8 @@ impl HydroNode {
             | HydroNode::FoldKeyed { input, .. }
             | HydroNode::Reduce { input, .. }
             | HydroNode::ReduceKeyed { input, .. }
-            | HydroNode::Counter { input, .. } => {
+            | HydroNode::Counter { input, .. }
+            | HydroNode::SampleEvery { input, .. } => {
                 transform(input.as_mut(), seen_tees);
             }
         }
@@ -2838,6 +2892,15 @@ impl HydroNode {
                 duration: duration.clone(),
                 prefix: prefix.clone(),
                 input: Box::new(input.deep_clone(seen_tees)),
+                metadata: metadata.clone(),
+            },
+            HydroNode::SampleEvery {
+                input,
+                interval,
+                metadata,
+            } => HydroNode::SampleEvery {
+                input: Box::new(input.deep_clone(seen_tees)),
+                interval: interval.clone(),
                 metadata: metadata.clone(),
             },
         }
@@ -4493,6 +4556,29 @@ impl HydroNode {
 
                         ident_stack.push(counter_ident);
                     }
+
+                    HydroNode::SampleEvery { interval, metadata, .. } => {
+                        let input_ident = ident_stack.pop().unwrap();
+                        let out_ident =
+                            syn::Ident::new(&format!("stream_{}", *next_stmt_id), Span::call_site());
+
+                        let element_type = match &metadata.collection_kind {
+                            CollectionKind::Stream { element_type, .. } => element_type.0.as_ref().clone(),
+                            _ => panic!("SampleEvery must have Stream collection kind"),
+                        };
+
+                        match builders_or_callback {
+                            BuildersOrCallback::Builders(graph_builders) => {
+                                graph_builders.emit_sample_every(&out_location, &input_ident, interval, &element_type, &out_ident);
+                            }
+                            BuildersOrCallback::Callback(_, node_callback) => {
+                                node_callback(node, next_stmt_id);
+                            }
+                        }
+
+                        *next_stmt_id += 1;
+                        ident_stack.push(out_ident);
+                    }
                 }
             },
             seen_tees,
@@ -4582,6 +4668,9 @@ impl HydroNode {
             HydroNode::Counter { duration, .. } => {
                 transform(duration);
             }
+            HydroNode::SampleEvery { interval, .. } => {
+                transform(interval);
+            }
         }
     }
 
@@ -4636,6 +4725,7 @@ impl HydroNode {
             | HydroNode::ReduceKeyedWatermark { metadata, .. }
             | HydroNode::ExternalInput { metadata, .. }
             | HydroNode::Network { metadata, .. }
+            | HydroNode::SampleEvery { metadata, .. }
             | HydroNode::Counter { metadata, .. } => metadata,
         }
     }
@@ -4691,6 +4781,7 @@ impl HydroNode {
             | HydroNode::ReduceKeyedWatermark { metadata, .. }
             | HydroNode::ExternalInput { metadata, .. }
             | HydroNode::Network { metadata, .. }
+            | HydroNode::SampleEvery { metadata, .. }
             | HydroNode::Counter { metadata, .. } => metadata,
         }
     }
@@ -4747,6 +4838,7 @@ impl HydroNode {
             | HydroNode::Unique { input, .. }
             | HydroNode::Network { input, .. }
             | HydroNode::Counter { input, .. }
+            | HydroNode::SampleEvery { input, .. }
             | HydroNode::ResolveFutures { input, .. }
             | HydroNode::ResolveFuturesBlocking { input, .. }
             | HydroNode::ResolveFuturesOrdered { input, .. }
@@ -4879,6 +4971,9 @@ impl HydroNode {
             HydroNode::ExternalInput { .. } => "ExternalInput()".to_owned(),
             HydroNode::Counter { tag, duration, .. } => {
                 format!("Counter({:?}, {:?})", tag, duration)
+            }
+            HydroNode::SampleEvery { interval, .. } => {
+                format!("SampleEvery({:?})", interval)
             }
         }
     }

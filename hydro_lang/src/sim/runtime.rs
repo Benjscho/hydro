@@ -500,6 +500,123 @@ impl SimHook for IntervalHook {
     }
 }
 
+/// A combined interval + singleton snapshot hook for `sample_every`.
+///
+/// Instead of decomposing into separate IntervalHook + SingletonHook + TopLevelFoldHook
+/// (which creates a tick with multiple hooks and combinatorial state space), this hook
+/// combines everything into a single observation-level decision: fire or don't fire.
+/// When it fires, it emits the latest singleton value. Subject to weak fairness.
+pub struct SampleEveryHook<T> {
+    pub input: Rc<RefCell<VecDeque<T>>>,
+    pub output: UnboundedSender<T>,
+    pub batch_location: HookLocationMeta,
+    pub format_item_debug: fn(&T) -> Option<String>,
+    pub fired: Option<bool>,
+    pub last_value: Option<T>,
+}
+
+impl<T: Clone> SimHook for SampleEveryHook<T> {
+    fn current_decision(&self) -> Option<bool> {
+        self.fired
+    }
+
+    fn can_make_nontrivial_decision(&self) -> bool {
+        // Can fire if we have a value to emit (either new input or last_value)
+        !self.input.borrow().is_empty() || self.last_value.is_some()
+    }
+
+    fn is_fairness_subject(&self) -> bool {
+        true
+    }
+
+    fn pending_count(&self) -> usize {
+        if self.last_value.is_some() || !self.input.borrow().is_empty() {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn autonomous_decision<'a>(
+        &mut self,
+        driver: &mut Borrowed<'a>,
+        force_nontrivial: bool,
+    ) -> bool {
+        // Drain input to get latest value
+        let mut input = self.input.borrow_mut();
+        if let Some(v) = input.pop_back() {
+            // Take the latest, discard older
+            input.clear();
+            self.last_value = Some(v);
+        }
+        drop(input);
+
+        if self.last_value.is_none() {
+            // No value to emit yet
+            self.fired = Some(false);
+            return false;
+        }
+
+        let fire = if force_nontrivial {
+            true
+        } else {
+            (0..=1usize).generate(driver).unwrap() == 1
+        };
+        self.fired = Some(fire);
+        fire
+    }
+
+    fn release_decision(&mut self, log_writer: &mut dyn std::fmt::Write) {
+        if let Some(fire) = self.fired.take() {
+            let (batch_location, line, caret_indent) = self.batch_location;
+
+            if fire {
+                let value = self.last_value.clone().unwrap();
+                let note_str = format!(
+                    "^ sample_every fired: {:?}",
+                    ManualDebug(&value, self.format_item_debug)
+                );
+
+                let _ = writeln!(
+                    log_writer,
+                    "{} {}",
+                    "-->".color(colored::Color::Blue),
+                    batch_location
+                );
+                let _ = writeln!(log_writer, " {}{}", "|".color(colored::Color::Blue), line);
+                let _ = writeln!(
+                    log_writer,
+                    " {}{}{}",
+                    "|".color(colored::Color::Blue),
+                    caret_indent,
+                    note_str.color(colored::Color::Green)
+                );
+
+                self.output.send(value).unwrap();
+            } else {
+                let note_str = "^ sample_every did not fire";
+
+                let _ = writeln!(
+                    log_writer,
+                    "{} {}",
+                    "-->".color(colored::Color::Blue),
+                    batch_location
+                );
+                let _ = writeln!(log_writer, " {}{}", "|".color(colored::Color::Blue), line);
+                let _ = writeln!(
+                    log_writer,
+                    " {}{}{}",
+                    "|".color(colored::Color::Blue),
+                    caret_indent,
+                    note_str.color(colored::Color::Green)
+                );
+            }
+        } else {
+            panic!("No decision to release");
+        }
+    }
+}
+
 pub struct KeyedStreamHook<K: Hash + Eq + Clone, V, Order: Ordering> {
     pub input: Rc<RefCell<FxHashMap<K, VecDeque<V>>>>, // FxHasher is deterministic
     pub to_release: Option<Vec<(K, V)>>,

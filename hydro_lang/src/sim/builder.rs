@@ -2093,6 +2093,78 @@ impl DfirBuilder for SimBuilder {
             None,
         );
     }
+
+    fn emit_sample_every(
+        &mut self,
+        location: &LocationId,
+        input_ident: &syn::Ident,
+        _interval_expr: &DebugExpr,
+        element_type: &syn::Type,
+        out_ident: &syn::Ident,
+    ) {
+        // In the sim, sample_every is a single observation-level hook that:
+        // 1. Buffers the latest singleton value from the fold output
+        // 2. Non-deterministically fires or doesn't fire (subject to weak fairness)
+        // 3. When it fires, emits the latest value
+        let root = get_this_crate();
+
+        let hoff_id = self.next_hoff_id;
+        self.next_hoff_id += 1;
+
+        let buffered_ident =
+            syn::Ident::new(&format!("__sample_every_buf_{hoff_id}"), Span::call_site());
+        let hoff_send_ident =
+            syn::Ident::new(&format!("__hoff_send_{hoff_id}"), Span::call_site());
+        let hoff_recv_ident =
+            syn::Ident::new(&format!("__hoff_recv_{hoff_id}"), Span::call_site());
+        let sink_ident =
+            syn::Ident::new(&format!("__sample_every_sink_{hoff_id}"), Span::call_site());
+
+        // Create the buffer and output channel
+        self.add_extra_stmt_internal(location, syn::parse_quote! {
+            let #buffered_ident = ::std::rc::Rc::new(::std::cell::RefCell::new(::std::collections::VecDeque::new()));
+        });
+
+        self.add_extra_stmt_internal(location, syn::parse_quote! {
+            let (#hoff_send_ident, #hoff_recv_ident) = __root_dfir_rs::util::unbounded_channel();
+        });
+
+        // Register the SampleEveryHook as an observation hook
+        self.add_hook(
+            location,
+            location,
+            syn::parse_quote!(
+                Box::new(#root::sim::runtime::SampleEveryHook {
+                    input: #buffered_ident.clone(),
+                    output: #hoff_send_ident,
+                    batch_location: ("sample_every", "", ""),
+                    format_item_debug: #root::__maybe_debug__!(#element_type),
+                    fired: None,
+                    last_value: None,
+                })
+            ),
+        );
+
+        // In the async DFIR: pipe the singleton output into the buffer
+        self.get_dfir_mut(location).add_dfir(
+            parse_quote! {
+                #sink_ident = #input_ident -> for_each(|v| {
+                    #buffered_ident.borrow_mut().push_back(v);
+                });
+            },
+            None,
+            None,
+        );
+
+        // Source the hook's output channel
+        self.get_dfir_mut(location).add_dfir(
+            parse_quote! {
+                #out_ident = source_stream(#hoff_recv_ident);
+            },
+            None,
+            None,
+        );
+    }
 }
 
 /// Extract a location string, line, and caret indent from an op's metadata backtrace.

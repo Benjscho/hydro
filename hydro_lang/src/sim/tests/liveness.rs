@@ -36,11 +36,11 @@ use crate::networking::TCP;
 use crate::nondet::nondet;
 use crate::prelude::FlowBuilder;
 
-/// Example 1: Repeated send over a lossy network via source_interval.
+/// Example 1: Repeated sampling over a lossy network via sample_every.
 ///
-/// A value is sent periodically over a lossy channel. Because the sender
-/// retries indefinitely (via interval), fairness guarantees that at least one
-/// attempt eventually arrives at the destination.
+/// A singleton value is sampled periodically and sent across a lossy channel.
+/// Because the source repeats infinitely, fairness guarantees that at least one
+/// sample eventually arrives at the destination.
 #[cfg(feature = "sim")]
 #[test]
 fn liveness_sample_every_over_lossy() {
@@ -48,18 +48,21 @@ fn liveness_sample_every_over_lossy() {
     let sender_loc = flow.process::<()>();
     let receiver_loc = flow.process::<()>();
 
-    // source_interval produces a stream of ticks; map each to our payload.
-    let retries = sender_loc
-        .source_interval(q!(Duration::from_secs(1)), nondet!(/** periodic retry */))
-        .map(q!(|_| 123_u32));
+    // A singleton value that will be repeatedly sampled and sent.
+    let value = sender_loc
+        .source_iter(q!(vec![123_u32]))
+        .fold(q!(|| 0u32), q!(|acc, v| *acc = v));
+
+    // Sample the singleton every 5 seconds (in sim, time is virtual).
+    let samples = value.sample_every(q!(Duration::from_secs(5)), nondet!(/** periodic retry */));
 
     // Send over a lossy network. Individual messages may be dropped,
     // but fairness ensures at least one eventually arrives.
-    let received = retries.send(&receiver_loc, TCP.lossy(nondet!(/** lossy network */)).bincode());
+    let received = samples.send(&receiver_loc, TCP.lossy(nondet!(/** lossy network */)).bincode());
 
     let out = received.sim_output();
 
-    // This assertion should PASS: the repeated sends + fairness guarantee
+    // This assertion should PASS: the repeated sampling + fairness guarantee
     // means at least one copy of 123 will arrive.
     flow.sim().max_lasso_steps(5).exhaustive(async || {
         out.assert_yields([123_u32]).await;
@@ -96,7 +99,7 @@ fn liveness_single_send_over_lossy_fails() {
 /// Example 3: Application-level retry with acknowledgment.
 ///
 /// This demonstrates a more realistic protocol where the sender retries
-/// indefinitely. Fairness ensures that eventually one send gets through.
+/// indefinitely via sample_every. Fairness ensures that eventually one send gets through.
 #[cfg(feature = "sim")]
 #[test]
 fn liveness_retry_with_ack() {
@@ -104,10 +107,13 @@ fn liveness_retry_with_ack() {
     let sender_loc = flow.process::<()>();
     let receiver_loc = flow.process::<()>();
 
-    // Retry the payload periodically over lossy.
-    let retries = sender_loc
-        .source_interval(q!(Duration::from_secs(1)), nondet!(/** retry interval */))
-        .map(q!(|_| 42_u32));
+    // The payload to send, stored as a singleton.
+    let payload = sender_loc
+        .source_iter(q!(vec![42_u32]))
+        .fold(q!(|| 0u32), q!(|acc, v| *acc = v));
+
+    // Retry the payload periodically over lossy via sample_every.
+    let retries = payload.sample_every(q!(Duration::from_secs(1)), nondet!(/** retry interval */));
 
     let received = retries.send(&receiver_loc, TCP.lossy(nondet!(/** lossy */)).bincode());
 

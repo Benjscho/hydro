@@ -1663,6 +1663,23 @@ impl HydroNode {
                 },
                 duration,
             ),
+
+            HydroNode::SampleEvery {
+                interval,
+                input,
+                metadata,
+            } => build_single_expr_transform(
+                TransformParams {
+                    structure,
+                    seen_tees,
+                    config,
+                    input,
+                    metadata,
+                    op_name: extract_op_name(self.print_root()),
+                    node_type: HydroNodeType::Transform,
+                },
+                interval,
+            ),
         }
     }
 }

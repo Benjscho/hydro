@@ -1165,19 +1165,27 @@ where
     pub fn sample_every(
         self,
         interval: impl QuotedWithContext<'a, std::time::Duration, L> + Copy + 'a,
-        nondet: NonDet,
+        _nondet: NonDet,
     ) -> Stream<T, L, Unbounded, TotalOrder, AtLeastOnce>
     where
         L: NoTick + NoAtomic,
     {
-        let samples = self.location.source_interval(interval);
-        sliced! {
-            let snapshot = use(self, nondet);
-            let sample_batch = use(samples, nondet);
+        let e = interval.splice_untyped_ctx(&self.location);
 
-            snapshot.filter_if(sample_batch.first().is_some()).into_stream()
-        }
-        .weaken_retries()
+        Stream::new(
+            self.location.clone(),
+            HydroNode::SampleEvery {
+                input: Box::new(self.ir_node.replace(HydroNode::Placeholder)),
+                interval: e.into(),
+                metadata: self.location.new_node_metadata(Stream::<
+                    T,
+                    L,
+                    Unbounded,
+                    TotalOrder,
+                    AtLeastOnce,
+                >::collection_kind()),
+            },
+        )
     }
 
     /// Strengthens the boundedness guarantee to `Bounded`, given that `B: IsBounded`, which
