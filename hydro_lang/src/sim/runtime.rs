@@ -93,6 +93,12 @@ pub trait SimHook {
     fn pending_count(&self) -> usize {
         0
     }
+
+    /// Returns a debug description of the most recently dropped message (if any).
+    /// Only meaningful for lossy hooks.
+    fn last_drop_info(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A hook that can make inline decisions during the execution of a tick.
@@ -202,6 +208,8 @@ pub struct StreamHook<T, Order: Ordering> {
     pub lossy: bool,
     pub is_interval: bool,
     pub _order: std::marker::PhantomData<Order>,
+    /// Debug description of the most recently dropped message (lossy mode only).
+    pub last_dropped: Option<String>,
 }
 
 impl<T> SimHook for StreamHook<T, TotalOrder> {
@@ -251,7 +259,14 @@ impl<T> SimHook for StreamHook<T, TotalOrder> {
             let item = current_input.pop_front().unwrap();
             let deliver: bool = (0..=1usize).generate(driver).unwrap() == 1;
 
-            self.to_release = Some(if deliver { vec![item] } else { vec![] });
+            if deliver {
+                self.to_release = Some(vec![item]);
+            } else {
+                let desc = (self.format_item_debug)(&item)
+                    .unwrap_or_else(|| std::any::type_name::<T>().to_owned());
+                self.last_dropped = Some(format!("{} (at {})", desc, self.batch_location.0));
+                self.to_release = Some(vec![]);
+            }
             deliver
         } else {
             let count = ((if force_nontrivial { 1 } else { 0 })..=current_input.len())
@@ -261,6 +276,10 @@ impl<T> SimHook for StreamHook<T, TotalOrder> {
             self.to_release = Some(current_input.drain(0..count).collect());
             count > 0
         }
+    }
+
+    fn last_drop_info(&self) -> Option<String> {
+        self.last_dropped.clone()
     }
 
     fn release_decision(&mut self, log_writer: &mut dyn std::fmt::Write) {
@@ -351,7 +370,14 @@ impl<T> SimHook for StreamHook<T, NoOrder> {
             let item = current_input.pop_front().unwrap();
             let deliver: bool = (0..=1usize).generate(driver).unwrap() == 1;
 
-            self.to_release = Some(if deliver { vec![item] } else { vec![] });
+            if deliver {
+                self.to_release = Some(vec![item]);
+            } else {
+                let desc = (self.format_item_debug)(&item)
+                    .unwrap_or_else(|| std::any::type_name::<T>().to_owned());
+                self.last_dropped = Some(format!("{} (at {})", desc, self.batch_location.0));
+                self.to_release = Some(vec![]);
+            }
             deliver
         } else {
             let mut out = vec![];
@@ -422,9 +448,11 @@ impl<T> SimHook for StreamHook<T, NoOrder> {
             panic!("No decision to release");
         }
     }
-}
 
-/// A hook representing a periodic interval/timer source in the simulator.
+    fn last_drop_info(&self) -> Option<String> {
+        self.last_dropped.clone()
+    }
+}
 ///
 /// Unlike `StreamHook`, this hook is always "enabled" (time can always advance)
 /// and non-deterministically fires or doesn't fire each step. It is subject to

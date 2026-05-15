@@ -75,7 +75,7 @@ fn liveness_sample_every_over_lossy() {
 /// This test demonstrates that liveness is NOT guaranteed for one-shot sends.
 #[cfg(feature = "sim")]
 #[test]
-#[should_panic]
+#[should_panic(expected = "lossy channel dropped a message")]
 fn liveness_single_send_over_lossy_fails() {
     let mut flow = FlowBuilder::new();
     let sender_loc = flow.process::<()>();

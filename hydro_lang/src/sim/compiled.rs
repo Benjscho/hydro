@@ -191,9 +191,53 @@ impl LassoDetector {
     }
 }
 
+/// Describes why the simulator entered quiescence.
+#[derive(Clone, Copy, Debug)]
+enum QuiescenceReason {
+    /// Normal quiescence: no more work to do without new external input.
+    Normal,
+    /// Normal quiescence, but lossy channels were present — a message may have been
+    /// dropped, leaving the system with no further work.
+    NormalWithDrops,
+    /// A fair lasso was detected: all fairness-subject hooks delivered at least once
+    /// in a repeated state cycle, yet the system made no forward progress. This means
+    /// the program cannot produce the expected output regardless of scheduling.
+    LivenessViolation,
+    /// The lasso detector exceeded its maximum step budget without finding a cycle.
+    Truncated,
+}
+
+impl std::fmt::Display for QuiescenceReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuiescenceReason::Normal => write!(f, "system quiesced (no more progress possible without new input)"),
+            QuiescenceReason::NormalWithDrops => write!(
+                f,
+                "system quiesced after a lossy channel dropped a message, leaving no \
+                 remaining work. The program has no retry mechanism to recover from this drop."
+            ),
+            QuiescenceReason::LivenessViolation => write!(
+                f,
+                "liveness violation detected: the system entered a cycle where all messages \
+                 were delivered at least once (fair scheduling) yet no new output was produced. \
+                 The program cannot make progress regardless of scheduling decisions."
+            ),
+            QuiescenceReason::Truncated => write!(
+                f,
+                "lasso step budget exceeded: the simulator could not determine whether the \
+                 system will eventually make progress (try increasing max_lasso_steps)"
+            ),
+        }
+    }
+}
+
 struct QuiescenceState {
     /// Set to true when the scheduler reaches quiescence; reset to false when new input is sent.
     quiescent: Cell<bool>,
+    /// The reason the scheduler most recently entered quiescence.
+    reason: Cell<QuiescenceReason>,
+    /// Debug description of the most recently dropped message (if any).
+    last_drop: RefCell<Option<String>>,
     /// Notified when the scheduler reaches quiescence (wakes receivers waiting for data).
     quiescence_notify: Notify,
     /// Notified when new input is sent, signaling the scheduler to resume.
@@ -212,13 +256,25 @@ impl QuiescenceState {
         self.quiescent.get()
     }
 
+    /// The reason for the most recent quiescence.
+    fn reason(&self) -> QuiescenceReason {
+        self.reason.get()
+    }
+
+    /// The most recently dropped message description.
+    fn last_drop(&self) -> Option<String> {
+        self.last_drop.borrow().clone()
+    }
+
     /// Returns a future that completes when the scheduler next reaches quiescence.
     fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.quiescence_notify.notified()
     }
 
-    /// Enter quiescence and wait for new input before continuing.
-    async fn wait_for_resume(&self) {
+    /// Enter quiescence with the given reason and wait for new input before continuing.
+    async fn wait_for_resume(&self, reason: QuiescenceReason, last_drop: Option<String>) {
+        self.reason.set(reason);
+        *self.last_drop.borrow_mut() = last_drop;
         self.quiescent.set(true);
         self.quiescence_notify.notify_waiters();
         self.resume_notify.notified().await;
@@ -594,6 +650,8 @@ impl<'a> CompiledSimInstance<'a> {
 
         let quiescence = Rc::new(QuiescenceState {
             quiescent: Cell::new(false),
+            reason: Cell::new(QuiescenceReason::Normal),
+            last_drop: RefCell::new(None),
             quiescence_notify: Notify::new(),
             resume_notify: Notify::new(),
         });
@@ -760,6 +818,28 @@ impl<T: Serialize + DeserializeOwned, O: Ordering, R: Retries> SimReceiver<T, O,
         thunk(&mut pin!(&mut quiescence_aware)).await
     }
 
+    /// Returns a description of why the system quiesced, for use in error messages.
+    fn quiescence_reason_msg(&self) -> String {
+        CURRENT_SIM_CONNECTIONS.with(|connections| {
+            let connections = connections.borrow();
+            let reason = connections.quiescence.reason();
+            let last_drop = connections.quiescence.last_drop();
+            let mut msg = format!(
+                "\n  {}: {}",
+                "reason".color(colored::Color::Yellow).bold(),
+                reason
+            );
+            if let Some(drop_desc) = last_drop {
+                msg.push_str(&format!(
+                    "\n  {}: {}",
+                    "last dropped message".color(colored::Color::Red).bold(),
+                    drop_desc
+                ));
+            }
+            msg
+        })
+    }
+
     /// Asserts that the stream has ended and no more messages can possibly arrive.
     pub fn assert_no_more(self) -> impl Future<Output = ()>
     where
@@ -770,7 +850,8 @@ impl<T: Serialize + DeserializeOwned, O: Ordering, R: Retries> SimReceiver<T, O,
                 self.with_stream(async |stream| {
                     if let Some(next) = stream.next().await {
                         return Err(format!(
-                            "Stream yielded unexpected message: {:?}, expected termination",
+                            "{}: {:?}, expected termination",
+                            "Stream yielded unexpected message".color(colored::Color::Red).bold(),
                             next
                         ));
                     }
@@ -805,7 +886,7 @@ impl<T: Serialize + DeserializeOwned, R: Retries> SimReceiver<T, TotalOrder, R> 
     where
         T: Debug + PartialEq<T2>,
     {
-        FutureTrackingCaller {
+          FutureTrackingCaller {
             future: async {
                 let mut expected: VecDeque<T2> = expected.into_iter().collect();
 
@@ -814,14 +895,17 @@ impl<T: Serialize + DeserializeOwned, R: Retries> SimReceiver<T, TotalOrder, R> 
                         let next_expected = expected.pop_front().unwrap();
                         if next != next_expected {
                             return Err(format!(
-                                "Stream yielded unexpected message: {:?}, expected: {:?}",
+                                "{}: {:?}, expected: {:?}",
+                                "Stream yielded unexpected message".color(colored::Color::Red).bold(),
                                 next, next_expected
                             ));
                         }
                     } else {
                         return Err(format!(
-                            "Stream ended early, still expected: {:?}",
-                            expected
+                            "{}, still expected: {:?}{}",
+                            "Stream ended early".color(colored::Color::Red).bold(),
+                            expected,
+                            self.quiescence_reason_msg()
                         ));
                     }
                 }
@@ -945,14 +1029,17 @@ impl<T: Serialize + DeserializeOwned> SimReceiver<T, NoOrder, ExactlyOnce> {
                                 expected.swap_remove(i);
                             } else {
                                 return Err(format!(
-                                    "Stream yielded unexpected message: {:?}",
+                                    "{}: {:?}",
+                                    "Stream yielded unexpected message".color(colored::Color::Red).bold(),
                                     next
                                 ));
                             }
                         } else {
                             return Err(format!(
-                                "Stream ended early, still expected: {:?}",
-                                expected
+                                "{}, still expected: {:?}{}",
+                                "Stream ended early".color(colored::Color::Red).bold(),
+                                expected,
+                                self.quiescence_reason_msg()
                             ));
                         }
                     }
@@ -1313,7 +1400,21 @@ impl<W: std::io::Write> LaunchedSim<W> {
                     }
 
                     // Signal quiescence and wait for new input.
-                    self.quiescence.wait_for_resume().await;
+                    // Check if there are fairness-subject hooks (lossy channels) to
+                    // provide a more informative quiescence reason.
+                    let has_lossy = self.hooks.values()
+                        .flatten()
+                        .any(|h| h.is_fairness_subject());
+                    let reason = if has_lossy {
+                        QuiescenceReason::NormalWithDrops
+                    } else {
+                        QuiescenceReason::Normal
+                    };
+                    let last_drop = self.hooks.values()
+                        .flatten()
+                        .filter_map(|h| h.last_drop_info())
+                        .last();
+                    self.quiescence.wait_for_resume(reason, last_drop).await;
                 } else {
                     // Run lasso detection before making any scheduling decision.
                     // Skip if we already have pending force delivery targets.
@@ -1325,9 +1426,78 @@ impl<W: std::io::Write> LaunchedSim<W> {
                             LassoResult::ForceDelivery(starved) => {
                                 force_delivery_targets = starved;
                             }
-                            LassoResult::LivenessViolation | LassoResult::Truncated => {
+                            LassoResult::LivenessViolation => {
+                                // Log the liveness violation
+                                match &mut self.log {
+                                    LogKind::Null => {}
+                                    LogKind::Stderr => {
+                                        eprintln!(
+                                            "\n{}",
+                                            "⚠ Liveness violation: the system entered a repeated state \
+                                             cycle where all fairness-subject hooks (lossy channels) \
+                                             delivered at least once, yet no new output was produced. \
+                                             The system has quiesced."
+                                                .color(colored::Color::Red)
+                                                .bold()
+                                        );
+                                    }
+                                    LogKind::Custom(writer) => {
+                                        let _ = writeln!(
+                                            writer,
+                                            "\n{}",
+                                            "⚠ Liveness violation: the system entered a repeated state \
+                                             cycle where all fairness-subject hooks (lossy channels) \
+                                             delivered at least once, yet no new output was produced. \
+                                             The system has quiesced."
+                                                .color(colored::Color::Red)
+                                                .bold()
+                                        );
+                                    }
+                                }
                                 // Declare quiescence — the test will fail if liveness expected
-                                self.quiescence.wait_for_resume().await;
+                                let last_drop = self.hooks.values()
+                                    .flatten()
+                                    .filter_map(|h| h.last_drop_info())
+                                    .last();
+                                self.quiescence.wait_for_resume(QuiescenceReason::LivenessViolation, last_drop).await;
+                                continue;
+                            }
+                            LassoResult::Truncated => {
+                                // Log the truncation
+                                match &mut self.log {
+                                    LogKind::Null => {}
+                                    LogKind::Stderr => {
+                                        eprintln!(
+                                            "\n{}",
+                                            format!(
+                                                "⚠ Lasso step budget ({}) exceeded without resolving \
+                                                 fairness. The system has quiesced.",
+                                                self.max_lasso_steps
+                                            )
+                                                .color(colored::Color::Yellow)
+                                                .bold()
+                                        );
+                                    }
+                                    LogKind::Custom(writer) => {
+                                        let _ = writeln!(
+                                            writer,
+                                            "\n{}",
+                                            format!(
+                                                "⚠ Lasso step budget ({}) exceeded without resolving \
+                                                 fairness. The system has quiesced.",
+                                                self.max_lasso_steps
+                                            )
+                                                .color(colored::Color::Yellow)
+                                                .bold()
+                                        );
+                                    }
+                                }
+                                // Declare quiescence — the test will fail if liveness expected
+                                let last_drop = self.hooks.values()
+                                    .flatten()
+                                    .filter_map(|h| h.last_drop_info())
+                                    .last();
+                                self.quiescence.wait_for_resume(QuiescenceReason::Truncated, last_drop).await;
                                 continue;
                             }
                             LassoResult::Continue => {}

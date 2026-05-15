@@ -185,7 +185,7 @@ impl DfirBuilder for SimBuilder {
                     self.add_hook(
                         in_location,
                         out_location,
-                        syn::parse_quote!(
+                          syn::parse_quote!(
                             Box::new(#root::sim::runtime::StreamHook::<_, #order_ty> {
                                 input: #buffered_ident.clone(),
                                 to_release: None,
@@ -195,6 +195,7 @@ impl DfirBuilder for SimBuilder {
                                 lossy: false,
                                 is_interval: false,
                                 _order: std::marker::PhantomData,
+                                last_dropped: None,
                             })
                         ),
                     );
@@ -1224,6 +1225,11 @@ impl DfirBuilder for SimBuilder {
             let hoff_recv_ident =
                 syn::Ident::new(&format!("__lossy_hoff_recv_{hoff_id}"), Span::call_site());
 
+            let lossy_location_desc = syn::LitStr::new(
+                &format!("lossy {:?} → {:?}", from, to),
+                Span::call_site(),
+            );
+
             match (from, to) {
                 (LocationId::Process(_), LocationId::Process(_)) => {
                     self.extra_stmts_global.push(syn::parse_quote! {
@@ -1257,7 +1263,7 @@ impl DfirBuilder for SimBuilder {
                         let (#hoff_send_ident, #hoff_recv_ident) = __root_dfir_rs::util::unbounded_channel();
                     });
 
-                    self.add_hook(
+                      self.add_hook(
                         to,
                         to,
                         syn::parse_quote!(
@@ -1265,11 +1271,12 @@ impl DfirBuilder for SimBuilder {
                                 input: #buffered_ident.clone(),
                                 to_release: None,
                                 output: #hoff_send_ident,
-                                batch_location: ("lossy network", "", ""),
+                                batch_location: (#lossy_location_desc, "", ""),
                                 format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
                                 lossy: true,
                                 is_interval: false,
                                 _order: std::marker::PhantomData,
+                                last_dropped: None,
                             })
                         ),
                     );
@@ -1348,11 +1355,12 @@ impl DfirBuilder for SimBuilder {
                                 input: #buffered_ident.clone(),
                                 to_release: None,
                                 output: #hoff_send_ident,
-                                batch_location: ("lossy network", "", ""),
+                                batch_location: (#lossy_location_desc, "", ""),
                                 format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
                                 lossy: true,
                                 is_interval: false,
                                 _order: std::marker::PhantomData,
+                                last_dropped: None,
                             })
                         ),
                     );
@@ -1439,7 +1447,7 @@ impl DfirBuilder for SimBuilder {
                             let (#hoff_send_ident, #hoff_recv_ident) = __root_dfir_rs::util::unbounded_channel();
                         });
 
-                    self.add_hook(
+                      self.add_hook(
                         to,
                         to,
                         syn::parse_quote!(
@@ -1447,11 +1455,12 @@ impl DfirBuilder for SimBuilder {
                                 input: #buffered_ident.clone(),
                                 to_release: None,
                                 output: #hoff_send_ident,
-                                batch_location: ("lossy network", "", ""),
+                                batch_location: (#lossy_location_desc, "", ""),
                                 format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
                                 lossy: true,
                                 is_interval: false,
                                 _order: std::marker::PhantomData,
+                                last_dropped: None,
                             })
                         ),
                     );
@@ -1553,11 +1562,12 @@ impl DfirBuilder for SimBuilder {
                                 input: #buffered_ident.clone(),
                                 to_release: None,
                                 output: #hoff_send_ident,
-                                batch_location: ("lossy network", "", ""),
+                                batch_location: (#lossy_location_desc, "", ""),
                                 format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
                                 lossy: true,
                                 is_interval: false,
                                 _order: std::marker::PhantomData,
+                                last_dropped: None,
                             })
                         ),
                     );
