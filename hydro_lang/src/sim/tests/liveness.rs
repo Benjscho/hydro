@@ -151,3 +151,65 @@ fn liveness_single_send_over_lossy_retry() {
         out.assert_yields_unordered([123_u32]).await;
     });
 }
+
+/// Example 5: Verify that lossy_retry actually injects duplicates.
+///
+/// Sends a single message over `lossy_retry()` and counts how many times it
+/// arrives (without deduplication). In at least one execution path, the
+/// simulator should inject a duplicate, causing the count to exceed 1.
+#[cfg(feature = "sim")]
+#[test]
+fn lossy_retry_injects_duplicates() {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    let saw_duplicate = AtomicBool::new(false);
+
+    let mut flow = FlowBuilder::new();
+    let sender_loc = flow.process::<()>();
+    let receiver_loc = flow.process::<()>();
+
+    let data = sender_loc.source_iter(q!(vec![42_u32]));
+    let received = data.send(&receiver_loc, TCP.lossy_retry().bincode());
+
+    // Output the raw AtLeastOnce stream (may contain duplicates).
+    let out = received.sim_output();
+
+    flow.sim().max_lasso_steps(5).exhaustive(async || {
+        let items = out.collect_all().await;
+        // At least one item must arrive (fairness guarantee).
+        assert!(!items.is_empty(), "Expected at least one delivery");
+        // All items should be the value we sent.
+        assert!(items.iter().all(|v| *v == 42), "Unexpected value in output");
+        if items.len() > 1 {
+            saw_duplicate.store(true, AtomicOrdering::Relaxed);
+        }
+    });
+
+    assert!(
+        saw_duplicate.load(AtomicOrdering::Relaxed),
+        "Expected the simulator to inject at least one duplicate delivery, but all executions delivered exactly once"
+    );
+}
+
+/// Example 6: Idempotent deduplication over lossy_retry is always correct despite duplicates.
+///
+/// Sends values over `lossy_retry()`, applies `unique()` to deduplicate, and
+/// verifies all values arrive exactly once regardless of how many duplicates the
+/// simulator injects.
+#[cfg(feature = "sim")]
+#[test]
+fn lossy_retry_idempotent_fold_correct() {
+    let mut flow = FlowBuilder::new();
+    let sender_loc = flow.process::<()>();
+    let receiver_loc = flow.process::<()>();
+
+    let data = sender_loc.source_iter(q!(vec![10_u32, 20_u32, 30_u32]));
+    let received = data.send(&receiver_loc, TCP.lossy_retry().bincode());
+
+    // unique() deduplicates — result should always be exactly {10, 20, 30}.
+    let out = received.unique().sim_output();
+
+    flow.sim().max_lasso_steps(5).exhaustive(async || {
+        out.assert_yields_unordered([10_u32, 20_u32, 30_u32]).await;
+    });
+}

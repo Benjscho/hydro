@@ -194,7 +194,6 @@ impl DfirBuilder for SimBuilder {
                                 format_item_debug: #root::__maybe_debug__!(#element_type),
                                 lossy: false,
                                 is_interval: false,
-                                fair_lossy: false,
                                 _order: std::marker::PhantomData,
                                 last_dropped: None,
                             })
@@ -1268,20 +1267,33 @@ impl DfirBuilder for SimBuilder {
                       self.add_hook(
                         to,
                         to,
-                        syn::parse_quote!(
-                            Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
-                                input: #buffered_ident.clone(),
-                                to_release: None,
-                                output: #hoff_send_ident,
-                                batch_location: (#lossy_location_desc, "", ""),
-                                format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
-                                lossy: #is_lossy,
-                                is_interval: false,
-                                fair_lossy: #is_fair_lossy,
-                                _order: std::marker::PhantomData,
-                                last_dropped: None,
-                            })
-                        ),
+                        if is_fair_lossy {
+                            syn::parse_quote!(
+                                Box::new(#root::sim::runtime::FairLossyHook::<__root_dfir_rs::bytes::Bytes> {
+                                    pending: #buffered_ident.clone(),
+                                    delivered: Vec::new(),
+                                    to_release: None,
+                                    output: #hoff_send_ident,
+                                    batch_location: (#lossy_location_desc, "", ""),
+                                    format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
+                                    max_duplicates: 2,
+                                })
+                            )
+                        } else {
+                            syn::parse_quote!(
+                                Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
+                                    input: #buffered_ident.clone(),
+                                    to_release: None,
+                                    output: #hoff_send_ident,
+                                    batch_location: (#lossy_location_desc, "", ""),
+                                    format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
+                                    lossy: #is_lossy,
+                                    is_interval: false,
+                                    _order: std::marker::PhantomData,
+                                    last_dropped: None,
+                                })
+                            )
+                        },
                     );
 
                     // Feed incoming messages into the buffer
@@ -1353,20 +1365,33 @@ impl DfirBuilder for SimBuilder {
                     self.add_hook(
                         to,
                         to,
-                        syn::parse_quote!(
-                            Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
-                                input: #buffered_ident.clone(),
-                                to_release: None,
-                                output: #hoff_send_ident,
-                                batch_location: (#lossy_location_desc, "", ""),
-                                format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
-                                lossy: #is_lossy,
-                                is_interval: false,
-                                fair_lossy: #is_fair_lossy,
-                                _order: std::marker::PhantomData,
-                                last_dropped: None,
-                            })
-                        ),
+                        if is_fair_lossy {
+                            syn::parse_quote!(
+                                Box::new(#root::sim::runtime::FairLossyHook::<(#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)> {
+                                    pending: #buffered_ident.clone(),
+                                    delivered: Vec::new(),
+                                    to_release: None,
+                                    output: #hoff_send_ident,
+                                    batch_location: (#lossy_location_desc, "", ""),
+                                    format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
+                                    max_duplicates: 2,
+                                })
+                            )
+                        } else {
+                            syn::parse_quote!(
+                                Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
+                                    input: #buffered_ident.clone(),
+                                    to_release: None,
+                                    output: #hoff_send_ident,
+                                    batch_location: (#lossy_location_desc, "", ""),
+                                    format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
+                                    lossy: #is_lossy,
+                                    is_interval: false,
+                                    _order: std::marker::PhantomData,
+                                    last_dropped: None,
+                                })
+                            )
+                        },
                     );
 
                     self.get_dfir_mut(to).add_dfir(
@@ -1454,20 +1479,33 @@ impl DfirBuilder for SimBuilder {
                       self.add_hook(
                         to,
                         to,
-                        syn::parse_quote!(
-                            Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
-                                input: #buffered_ident.clone(),
-                                to_release: None,
-                                output: #hoff_send_ident,
-                                batch_location: (#lossy_location_desc, "", ""),
-                                format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
-                                lossy: #is_lossy,
-                                is_interval: false,
-                                fair_lossy: #is_fair_lossy,
-                                _order: std::marker::PhantomData,
-                                last_dropped: None,
-                            })
-                        ),
+                        if is_fair_lossy {
+                            syn::parse_quote!(
+                                Box::new(#root::sim::runtime::FairLossyHook::<__root_dfir_rs::bytes::Bytes> {
+                                    pending: #buffered_ident.clone(),
+                                    delivered: Vec::new(),
+                                    to_release: None,
+                                    output: #hoff_send_ident,
+                                    batch_location: (#lossy_location_desc, "", ""),
+                                    format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
+                                    max_duplicates: 2,
+                                })
+                            )
+                        } else {
+                            syn::parse_quote!(
+                                Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
+                                    input: #buffered_ident.clone(),
+                                    to_release: None,
+                                    output: #hoff_send_ident,
+                                    batch_location: (#lossy_location_desc, "", ""),
+                                    format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
+                                    lossy: #is_lossy,
+                                    is_interval: false,
+                                    _order: std::marker::PhantomData,
+                                    last_dropped: None,
+                                })
+                            )
+                        },
                     );
 
                     self.get_dfir_mut(to).add_dfir(
@@ -1562,20 +1600,33 @@ impl DfirBuilder for SimBuilder {
                     self.add_hook(
                         to,
                         to,
-                        syn::parse_quote!(
-                            Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
-                                input: #buffered_ident.clone(),
-                                to_release: None,
-                                output: #hoff_send_ident,
-                                batch_location: (#lossy_location_desc, "", ""),
-                                format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
-                                lossy: #is_lossy,
-                                is_interval: false,
-                                fair_lossy: #is_fair_lossy,
-                                _order: std::marker::PhantomData,
-                                last_dropped: None,
-                            })
-                        ),
+                        if is_fair_lossy {
+                            syn::parse_quote!(
+                                Box::new(#root::sim::runtime::FairLossyHook::<(#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)> {
+                                    pending: #buffered_ident.clone(),
+                                    delivered: Vec::new(),
+                                    to_release: None,
+                                    output: #hoff_send_ident,
+                                    batch_location: (#lossy_location_desc, "", ""),
+                                    format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
+                                    max_duplicates: 2,
+                                })
+                            )
+                        } else {
+                            syn::parse_quote!(
+                                Box::new(#root::sim::runtime::StreamHook::<_, #root::live_collections::stream::TotalOrder> {
+                                    input: #buffered_ident.clone(),
+                                    to_release: None,
+                                    output: #hoff_send_ident,
+                                    batch_location: (#lossy_location_desc, "", ""),
+                                    format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
+                                    lossy: #is_lossy,
+                                    is_interval: false,
+                                    _order: std::marker::PhantomData,
+                                    last_dropped: None,
+                                })
+                            )
+                        },
                     );
 
                     self.get_dfir_mut(to).add_dfir(

@@ -207,7 +207,6 @@ pub struct StreamHook<T, Order: Ordering> {
     pub format_item_debug: fn(&T) -> Option<String>,
     pub lossy: bool,
     pub is_interval: bool,
-    pub fair_lossy: bool,
     pub _order: std::marker::PhantomData<Order>,
     /// Debug description of the most recently dropped message (lossy mode only).
     pub last_dropped: Option<String>,
@@ -227,7 +226,7 @@ impl<T> SimHook for StreamHook<T, TotalOrder> {
     }
 
     fn is_fairness_subject(&self) -> bool {
-        self.lossy || self.is_interval || self.fair_lossy
+        self.lossy || self.is_interval
     }
 
     fn pending_count(&self) -> usize {
@@ -339,7 +338,7 @@ impl<T> SimHook for StreamHook<T, NoOrder> {
     }
 
     fn is_fairness_subject(&self) -> bool {
-        self.lossy || self.is_interval || self.fair_lossy
+        self.lossy || self.is_interval
     }
 
     fn pending_count(&self) -> usize {
@@ -454,6 +453,138 @@ impl<T> SimHook for StreamHook<T, NoOrder> {
         self.last_dropped.clone()
     }
 }
+
+/// A hook for `lossy_retry()` channels that guarantees eventual delivery (fairness)
+/// and injects bounded duplicates to test idempotence.
+pub struct FairLossyHook<T> {
+    pub pending: Rc<RefCell<VecDeque<T>>>,
+    pub delivered: Vec<(T, u8)>,
+    pub to_release: Option<Vec<T>>,
+    pub output: UnboundedSender<T>,
+    pub batch_location: HookLocationMeta,
+    pub format_item_debug: fn(&T) -> Option<String>,
+    pub max_duplicates: u8,
+}
+
+impl<T: Clone> SimHook for FairLossyHook<T> {
+    fn current_decision(&self) -> Option<bool> {
+        self.to_release.as_ref().map(|v| !v.is_empty())
+    }
+
+    fn can_make_nontrivial_decision(&self) -> bool {
+        !self.pending.borrow().is_empty()
+    }
+
+    fn is_fairness_subject(&self) -> bool {
+        true
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending.borrow().len()
+    }
+
+    fn autonomous_decision<'a>(
+        &mut self,
+        driver: &mut Borrowed<'a>,
+        force_nontrivial: bool,
+    ) -> bool {
+        let mut current_input = self.pending.borrow_mut();
+        let mut out = vec![];
+
+        if force_nontrivial {
+            // Deliver all pending items
+            let fresh: Vec<T> = current_input.drain(..).collect();
+            for item in fresh {
+                out.push(item.clone());
+                if self.max_duplicates > 0 {
+                    self.delivered.push((item, self.max_duplicates));
+                }
+            }
+        } else {
+            // NoOrder selection from pending
+            let mut min_index = 0;
+            while !current_input.is_empty() {
+                if produce().generate(driver).unwrap() {
+                    break;
+                }
+
+                let idx = (min_index..current_input.len()).generate(driver).unwrap();
+                let item = current_input.remove(idx).unwrap();
+                out.push(item.clone());
+                if self.max_duplicates > 0 {
+                    self.delivered.push((item, self.max_duplicates));
+                }
+
+                min_index = idx;
+                if min_index == current_input.len() {
+                    break;
+                }
+            }
+        }
+
+        drop(current_input);
+
+        // Binary choice: inject one duplicate from delivered
+        if !self.delivered.is_empty() {
+            let inject: bool = (0..=1usize).generate(driver).unwrap() == 1;
+            if inject {
+                let idx = (0..self.delivered.len()).generate(driver).unwrap();
+                let dup = self.delivered[idx].0.clone();
+                out.push(dup);
+                self.delivered[idx].1 -= 1;
+                if self.delivered[idx].1 == 0 {
+                    self.delivered.swap_remove(idx);
+                }
+            }
+        }
+
+        let was_nontrivial = !out.is_empty();
+        self.to_release = Some(out);
+        was_nontrivial
+    }
+
+    fn release_decision(&mut self, log_writer: &mut dyn std::fmt::Write) {
+        if let Some(to_release) = self.to_release.take() {
+            let (batch_location, line, caret_indent) = self.batch_location;
+            let note_str = if to_release.is_empty() {
+                "^ releasing no items".to_owned()
+            } else {
+                format!(
+                    "^ releasing fair_lossy items: {:?}",
+                    TruncatedVecDebug(
+                        RefCell::new(Some(to_release.iter())),
+                        8,
+                        self.format_item_debug
+                    )
+                )
+            };
+
+            let _ = writeln!(
+                log_writer,
+                "{} {}",
+                "-->".color(colored::Color::Blue),
+                batch_location
+            );
+
+            let _ = writeln!(log_writer, " {}{}", "|".color(colored::Color::Blue), line);
+
+            let _ = writeln!(
+                log_writer,
+                " {}{}{}",
+                "|".color(colored::Color::Blue),
+                caret_indent,
+                note_str.color(colored::Color::Green)
+            );
+
+            for item in to_release {
+                self.output.send(item).unwrap();
+            }
+        } else {
+            panic!("No decision to release");
+        }
+    }
+}
+
 ///
 /// Unlike `StreamHook`, this hook is always "enabled" (time can always advance)
 /// and non-deterministically fires or doesn't fire each step. It is subject to

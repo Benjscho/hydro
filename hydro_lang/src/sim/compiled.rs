@@ -25,7 +25,9 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use super::runtime::{Hooks, InlineHooks};
 use super::{SimClusterReceiver, SimClusterSender, SimReceiver, SimSender};
 use crate::compile::builder::ExternalPortId;
-use crate::live_collections::stream::{ExactlyOnce, NoOrder, Ordering, Retries, TotalOrder};
+use crate::live_collections::stream::{
+    AtLeastOnce, ExactlyOnce, NoOrder, Ordering, Retries, TotalOrder,
+};
 use crate::location::dynamic::LocationId;
 use crate::sim::graph::{SimExternalPort, SimExternalPortRegistry};
 use crate::sim::runtime::SimHook;
@@ -1065,6 +1067,16 @@ impl<T: Serialize + DeserializeOwned> SimReceiver<T, NoOrder, ExactlyOnce> {
             second: self.assert_no_more(),
             first_done: false,
         }
+    }
+}
+
+impl<T: Serialize + DeserializeOwned> SimReceiver<T, NoOrder, AtLeastOnce> {
+    /// Collects all remaining messages from the external bincode stream into a Vec.
+    /// This will wait until no more messages can possibly arrive.
+    /// Unlike `ExactlyOnce` streams, this may contain duplicates.
+    pub async fn collect_all(self) -> Vec<T> {
+        self.with_stream(async |stream| stream.collect().await)
+            .await
     }
 }
 

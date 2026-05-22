@@ -1,5 +1,9 @@
 # Fair Lossy Channel: `TCP.lossy_retry()`
 
+## Status
+
+**v2 implemented.** The type system (`LossyRetry` policy, `AtLeastOnce`/`NoOrder` output), API (`TCP.lossy_retry().bincode()`), simulator wiring (dedicated `FairLossyHook` with bounded duplicate injection), deploy support, and tests (liveness, duplicate injection verification, deduplication correctness) are all in place.
+
 ## Summary
 
 Add a new TCP failure policy, `lossy_retry()`, that models a channel where individual messages may be lost but the sender automatically retries, producing an output stream with `AtLeastOnce` retries and `NoOrder` ordering. This captures the most common real-world distributed systems pattern — unreliable delivery with application-level retries — as a first-class channel type, eliminating the need for users to manually wire `sample_every` + `lossy` loops.
@@ -180,20 +184,18 @@ The `Network` IR node already carries `networking_info: NetworkingInfo`. The com
 
 ### Hook Design
 
-The `lossy_retry` channel uses a new hook mode: **"fair lossy with duplicates"**. The hook:
+The `lossy_retry` channel uses a dedicated `FairLossyHook<T>` that guarantees eventual delivery (fairness) without permanent drops, and injects bounded duplicates to test idempotence.
 
-1. Buffers incoming messages (same as current lossy hook)
-2. On each scheduling decision:
-   - Non-deterministically picks 0 or more items from the buffer to deliver
-   - Delivered items are **NOT removed** from the buffer (they can be re-delivered = duplicates)
-   - Non-deterministically removes 0 or more items from the buffer (modeling "sender gave up" or "ack received" — but since we guarantee at-least-once, at least one copy must have been delivered before removal)
-3. Is a **fairness subject** — the lasso detector forces delivery if the system cycles
+Key design decisions:
+- `can_make_nontrivial_decision()` only considers `pending` items (not `delivered`). Duplicates are injected opportunistically when the hook is already scheduled for pending deliveries. This prevents the scheduler from spinning on duplicate injection alone.
+- Each delivered item has a bounded duplicate budget (default K=2). After K re-deliveries, the item is removed from `delivered`.
+- The binary "inject duplicate?" choice adds at most 1 bit of branching per step.
 
-Actually, a simpler and more correct model:
+#### Planned v2 Enhancement: Standalone Duplicate Injection
 
-### Simplified Hook Model
+The current design only injects duplicates when there are also pending items to deliver. A future enhancement could allow the hook to inject duplicates even when `pending` is empty (by making `can_make_nontrivial_decision` consider `delivered`), but this requires careful integration with the scheduler to avoid infinite loops.
 
-Since `lossy_retry()` guarantees eventual delivery, the simulator can model it as:
+Since `lossy_retry()` guarantees eventual delivery, the simulator models it as:
 
 1. Messages enter a buffer (never permanently dropped)
 2. On each scheduling step, the hook non-deterministically:
@@ -202,53 +204,98 @@ Since `lossy_retry()` guarantees eventual delivery, the simulator can model it a
 3. **Fairness**: If a message has been in the buffer for a full lasso cycle without delivery, force it to be delivered
 4. Messages are removed from the buffer only after delivery (but may be re-added to model duplicates)
 
-Even simpler — since we want to test that downstream code handles duplicates correctly:
+### Where Duplicates Fit in the Flow
 
-### Recommended Hook Model (Simplest Correct Approach)
+The data flow for a `lossy_retry` channel is:
 
 ```
-Buffer: VecDeque<T> (messages waiting to be delivered)
-Delivered: Vec<T> (messages that have been delivered at least once)
-
-On each step:
-  1. Pick 0..=buffer.len() items from buffer → deliver them, move to Delivered
-  2. Pick 0..=delivered.len() items from Delivered → re-deliver them (duplicates)
-  3. Fairness: if buffer is non-empty for a full cycle, force delivery of all
-
-Output ordering: NoOrder (items delivered in any order, duplicates interleaved)
+Sender async DFIR  →  unbounded channel  →  Receiver async DFIR  →  hook buffer
+                                                                         ↓
+                                                              hook autonomous_decision
+                                                                         ↓
+                                                              hoff_send (output channel)
+                                                                         ↓
+                                                              Receiver async DFIR (source_stream)
+                                                                         ↓
+                                                              batch hook buffer (normal batch boundary)
+                                                                         ↓
+                                                              Tick DFIR (application logic)
 ```
 
-This correctly models:
-- **Eventual delivery**: fairness forces buffer to drain
-- **Duplicates**: items in `Delivered` can be re-sent
-- **No ordering**: items delivered in arbitrary order
+The `fair_lossy` hook sits at the **network delivery boundary** — between the raw network buffer and the receiver's async dataflow. This is the correct place to inject duplicates because:
+
+1. It models "the network delivered this message twice" — the most accurate real-world semantics
+2. Duplicates flow through the normal `batch` mechanism, so they're visible to tick-level code exactly as they would be in production
+3. The hook already has access to the buffer contents and controls what gets sent downstream
+4. It doesn't interfere with the lasso detector's fairness logic (duplicates are orthogonal to "has the buffer drained?")
+
+### Hook Model: Fair Lossy with Duplicate Injection
+
+The hook maintains two data structures:
+
+```rust
+struct FairLossyState<T> {
+    /// Messages waiting for first delivery. Fairness forces these to eventually drain.
+    pending: VecDeque<T>,
+    /// Messages that have been delivered at least once. Can be re-delivered as duplicates.
+    /// Bounded to at most `max_duplicates_per_item` re-deliveries per item.
+    delivered: Vec<(T, u8)>,  // (item, remaining_duplicate_budget)
+}
+```
+
+On each scheduling step, `autonomous_decision` does:
+
+```
+1. From `pending`: pick 0..=pending.len() items to deliver (NoOrder selection)
+   - Delivered items move to `delivered` with budget = K (e.g., K=2)
+   - Fairness: if force_nontrivial, deliver all pending items
+
+2. From `delivered`: non-deterministically pick 0 or 1 items to re-deliver (duplicate)
+   - Decrement the item's budget
+   - When budget reaches 0, remove from `delivered`
+   - This is a binary choice (duplicate or not) to keep branching constant
+
+3. Combine fresh deliveries + duplicate into the output batch
+```
+
+Key properties:
+- **Eventual delivery**: fairness forces `pending` to drain (liveness)
+- **Duplicates are bounded**: each item can be re-delivered at most K times (finite state space)
+- **Constant branching for duplicates**: binary choice "inject a duplicate this step or not" — doesn't explode the state space
+- **Duplicates are interleaved with fresh deliveries**: models real-world behavior where a retry arrives mixed with new messages
 
 ### Interaction with Lasso Detector
 
-The hook is a fairness subject. Its `pending_count()` returns `buffer.len()`. The fingerprint uses `min(1)` so "1 pending" and "5 pending" are the same abstract state. When the lasso forces delivery, all buffered items are delivered.
-
-For duplicates: the lasso detector doesn't need to force duplicates. Duplicates are explored by the fuzzer during normal execution. The key property is that the *buffer eventually drains* (liveness), and *duplicates may occur* (safety testing).
+- `pending_count()` returns `pending.len()` — only undelivered items count for fairness
+- `can_make_nontrivial_decision()` returns `true` only if `pending` is non-empty (duplicates are opportunistic, not forced)
+- The fingerprint uses `pending.len().min(1)` — duplicates in `delivered` don't affect the fingerprint since they don't represent "stuck" state
+- When forced by lasso: deliver all `pending` items, do NOT force duplicates (duplicates are a safety concern, not a liveness concern)
 
 ### Exhaustive Mode Considerations
 
-In exhaustive mode, the state space must be bounded. The duplicate re-delivery creates potential for unbounded exploration. To bound it:
+The duplicate budget K bounds the state space:
+- Each message contributes at most K+1 deliveries total (1 original + K duplicates)
+- The binary "inject duplicate?" choice adds at most 1 bit of branching per step
+- For K=2, a message sent once can appear 1, 2, or 3 times at the receiver — sufficient to catch most idempotence bugs
 
-- Each message can be re-delivered at most `K` times (e.g., K=2 or K=3)
-- After K deliveries, the message is removed from the `Delivered` set
-- This is sufficient to test idempotence without infinite state space
+**Recommended K=2** for the default. This catches:
+- Code that assumes exactly-once delivery (breaks on first duplicate)
+- Code with off-by-one errors in deduplication logic (breaks on second duplicate)
+- Without creating excessive state space (K=2 means at most 3 total deliveries per message)
 
-Alternatively, model duplicates as a simple boolean per step: "did any duplicate occur?" This keeps branching constant.
+### Why Not Inject Duplicates Elsewhere?
 
-**Recommended approach for v1**: Don't model re-delivery of already-delivered messages. Instead, model the channel as:
-1. Messages buffer, non-deterministically delivered (like current lossy, but never dropped)
-2. The `AtLeastOnce` type annotation forces downstream to prove idempotence
-3. Actual duplicate testing is deferred to a follow-up (or handled by the existing `sample_every` pattern on the sender side, which naturally produces duplicates)
+**At the sender side** (before the network): Wrong abstraction. The sender sends once; it's the *channel* that retries. Injecting at the sender would require the sender's code to be aware of retries.
 
-This gives us the type safety and ergonomics benefits immediately, with the option to add explicit duplicate injection later.
+**At the batch boundary** (between async and tick): Too late. The batch hook already has its own non-determinism (batch size selection). Injecting duplicates there would conflate two independent sources of non-determinism and make the simulator harder to reason about.
+
+**At the tick level** (inside the tick DFIR): Way too late. The tick processes a batch atomically — injecting duplicates mid-tick doesn't model any real-world scenario.
+
+The network delivery hook is the only place that correctly models "the network delivered this message more than once."
 
 ## Implementation Steps
 
-### Step 1: Add `LossyRetry` Failure Policy
+### Step 1: Add `LossyRetry` Failure Policy ✅
 
 **Files**: `hydro_lang/src/networking/mod.rs`
 
@@ -257,17 +304,17 @@ This gives us the type safety and ergonomics benefits immediately, with the opti
 3. Add `lossy_retry()` method on `NetworkingConfig<Tcp<()>, S>`
 4. Set `OrderingGuarantee = NoOrder`
 
-### Step 2: Add `RetryGuarantee` to `NetworkFor` Trait
+### Step 2: Add `RetryGuarantee` to `NetworkFor` Trait ✅
 
 **Files**: `hydro_lang/src/networking/mod.rs`, `hydro_lang/src/live_collections/stream/networking.rs`
 
-1. Add `type RetryGuarantee: Retries` to `NetworkFor` trait
+1. Add `type RetryGuarantee: Retries` to `NetworkFor` trait (and `TcpFailPolicy`, `TransportKind`)
 2. Set `RetryGuarantee = ExactlyOnce` for existing channels (preserves current behavior)
 3. Set `RetryGuarantee = AtLeastOnce` for `LossyRetry`
 4. Update `send` return type to use `MinRetries<N::RetryGuarantee>::Min`
 5. Update all `send` variants (process-to-process, process-to-cluster, cluster-to-process, etc.)
 
-### Step 3: Update IR and Compile Layer
+### Step 3: Update IR and Compile Layer ✅
 
 **Files**: `hydro_lang/src/compile/ir/mod.rs`, `hydro_lang/src/networking/mod.rs`
 
@@ -275,42 +322,39 @@ This gives us the type safety and ergonomics benefits immediately, with the opti
 2. Ensure the `Network` IR node correctly propagates the `AtLeastOnce` retry through `CollectionKind`
 3. Update any match statements on `TcpFault` (deploy graph, maelstrom, etc.)
 
-### Step 4: Simulator Wiring
+### Step 4: Simulator Wiring with Duplicate Injection ✅
 
 **Files**: `hydro_lang/src/sim/builder.rs`, `hydro_lang/src/sim/runtime.rs`
 
-1. In `SimBuilder::create_network`, handle `TcpFault::LossyRetry`:
-   - Wire like current `Lossy` (buffer + hook + channel)
-   - But use a hook that **never permanently drops** — it only delays delivery
-   - Mark the hook as a fairness subject (same as lossy)
-2. Create a `FairLossyHook` (or add a `fair_lossy` mode to `StreamHook`):
-   - `autonomous_decision`: pick 0..=N items to deliver (like `NoOrder` non-lossy hook), but items stay in buffer until delivered at least once
-   - `is_fairness_subject() = true`
-   - `is_lossy() = false` (it's not lossy in the "permanent drop" sense)
-   - When forced by lasso: deliver all buffered items
-
-The simplest implementation: reuse `StreamHook<T, NoOrder>` with `lossy: false`. This already:
-- Picks a random subset to deliver
-- Never drops items (non-lossy mode drains from buffer into output)
-- Is not a fairness subject by default
-
-We just need to make it a fairness subject so the lasso forces progress. Add a new field:
+Implemented a dedicated `FairLossyHook<T>` struct that replaces the v1 `fair_lossy: bool` stopgap on `StreamHook`:
 
 ```rust
-pub struct StreamHook<T, Order: Ordering> {
-    // ... existing fields ...
-    pub fair_lossy: bool,  // NEW: fairness subject but never drops
+pub struct FairLossyHook<T> {
+    pub pending: Rc<RefCell<VecDeque<T>>>,
+    pub delivered: Vec<(T, u8)>,  // (item, remaining_duplicate_budget)
+    pub to_release: Option<Vec<T>>,
+    pub output: UnboundedSender<T>,
+    pub batch_location: HookLocationMeta,
+    pub format_item_debug: fn(&T) -> Option<String>,
+    pub max_duplicates: u8,  // default: 2
 }
 ```
 
-And update `is_fairness_subject()`:
-```rust
-fn is_fairness_subject(&self) -> bool {
-    self.lossy || self.is_interval || self.fair_lossy
-}
-```
+`SimHook` implementation:
+- `is_fairness_subject() = true`
+- `is_lossy() = false` (never permanently drops)
+- `pending_count()` = `pending.len()`
+- `can_make_nontrivial_decision()` = `!pending.is_empty()` (only pending items count — duplicates are opportunistic)
+- `autonomous_decision`:
+  - From `pending`: NoOrder selection (same pattern as `StreamHook<T, NoOrder>`)
+  - Delivered items move to `delivered` with budget = `max_duplicates`
+  - Binary choice: inject one duplicate from `delivered` (decrement budget, remove if 0)
+  - When `force_nontrivial`: deliver all `pending`, no forced duplicates
+- `release_decision`: send all items in `to_release` to `output`
 
-### Step 5: Deploy Runtime Support
+In `SimBuilder::create_network`, `TcpFault::LossyRetry` emits `FairLossyHook` (the `fair_lossy` field was removed from `StreamHook`).
+
+### Step 5: Deploy Runtime Support ✅
 
 **Files**: `hydro_lang/src/deploy/deploy_graph.rs`, `hydro_lang/src/deploy/deploy_graph_containerized.rs`
 
@@ -323,32 +367,34 @@ In production, TCP already provides reliable delivery within a connection. The `
 - Buffer and resend messages that were in-flight during disconnection
 - Accept that duplicates may occur (e.g., message sent, ack lost, resent)
 
-For v1, deploy can treat `LossyRetry` identically to `FailStop` at the transport level, since TCP handles reliability. The semantic difference is only in the type system and simulator.
+For v1, deploy treats `LossyRetry` identically to `FailStop` at the transport level, since TCP handles reliability. The semantic difference is only in the type system and simulator.
 
-### Step 6: Tests
+### Step 6: Tests ✅
 
-**Files**: `hydro_lang/src/sim/tests/liveness.rs` (or new test file)
+**Files**: `hydro_lang/src/sim/tests/liveness.rs`
 
-1. Basic delivery test: send over `lossy_retry()`, assert message arrives
-2. Idempotence enforcement: verify that `fold` on a `lossy_retry()` stream requires idempotence proof
-3. Ordering enforcement: verify that `for_each` on a `lossy_retry()` stream requires `assume_ordering`
-4. Liveness test: send a single message over `lossy_retry()`, assert it eventually arrives (fairness)
-5. Compare with `lossy`: same test with `lossy()` should fail (no retry), with `lossy_retry()` should pass
+1. ~~Basic delivery test~~ ✅ (`liveness_single_send_over_lossy_retry`)
+2. Idempotence enforcement: verify that `fold` on a `lossy_retry()` stream requires idempotence proof (enforced by type system — compile-time)
+3. Ordering enforcement: verify that `for_each` on a `lossy_retry()` stream requires `assume_ordering` (enforced by type system — compile-time)
+4. ~~Liveness test~~ ✅ (`liveness_single_send_over_lossy_retry`)
+5. Compare with `lossy`: same test with `lossy()` should fail (no retry), with `lossy_retry()` should pass (covered by existing `liveness_single_send_over_lossy_fails`)
+6. ~~Duplicate safety test~~ ✅ (`lossy_retry_injects_duplicates`) — verifies the simulator actually injects duplicates
+7. ~~Duplicate correctness test~~ ✅ (`lossy_retry_idempotent_fold_correct`) — verifies `unique()` correctly deduplicates despite duplicates
 
-### Step 7: Documentation
+### Step 7: Documentation ✅ (partial)
 
-1. Add rustdoc to `lossy_retry()` method
+1. ~~Add rustdoc to `lossy_retry()` method~~ ✅
 2. Update the networking reference docs
 3. Add an example showing a simple request-response protocol using `lossy_retry()`
 
 ## Open Questions
 
-1. **Should `lossy_retry()` require a `NonDet` guard?** Current recommendation: No, because the non-determinism (duplicates, reordering) is fully captured by the output type. The channel provides a *stronger* guarantee than `lossy` (eventual delivery), so it's less "unsafe."
+1. **Should `lossy_retry()` require a `NonDet` guard?** ✅ Resolved: No. The non-determinism (duplicates, reordering) is fully captured by the output type. The channel provides a *stronger* guarantee than `lossy` (eventual delivery), so it's less "unsafe."
 
-2. **Should we model explicit duplicates in the simulator?** For v1, the type system enforcement (requiring idempotence proofs) is sufficient. Explicit duplicate injection can be added later as an enhancement to catch bugs where the idempotence proof is incorrect.
+2. **What about the deploy runtime?** ✅ Resolved: For v1, treat as `FailStop` in production. Real retry/reconnection logic can be added incrementally.
 
-3. **What about the deploy runtime?** For v1, treat as `FailStop` in production. Real retry/reconnection logic can be added incrementally.
+3. **Naming**: ✅ Resolved: `lossy_retry()` for consistency with the existing `lossy()` naming.
 
-4. **Naming**: `lossy_retry()` vs `at_least_once()` vs `reliable()` vs `fair_lossy()`? The name should convey both the failure model (messages can be lost) and the recovery (retries ensure delivery). `lossy_retry()` is explicit about both. `at_least_once()` focuses on the guarantee. Recommendation: `lossy_retry()` for consistency with the existing `lossy()` naming.
+4. **Should there be a variant with ordering?** A `lossy_retry_ordered()` that preserves ordering (models TCP with reconnection where sequence numbers ensure ordering) could be useful but adds complexity. Defer to follow-up.
 
-5. **Should there be a variant with ordering?** A `lossy_retry_ordered()` that preserves ordering (models TCP with reconnection where sequence numbers ensure ordering) could be useful but adds complexity. Defer to follow-up.
+5. **Should `T: Clone` be required for `FairLossyHook`?** The hook needs to re-deliver items from `delivered`, which requires cloning. Since the hook operates on serialized `Bytes` (not the user's type `T`), and `Bytes` is cheaply cloneable (reference-counted), this is not a concern in practice. The hook type parameter is `Bytes`, not the user's `T`.
