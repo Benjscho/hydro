@@ -64,7 +64,7 @@ impl<'a> Deploy<'a> for HydroDeploy {
     ) -> (syn::Expr, syn::Expr) {
         match networking_info {
             crate::networking::NetworkingInfo::Tcp {
-                fault: crate::networking::TcpFault::FailStop,
+                fault: crate::networking::TcpFault::FailStop | crate::networking::TcpFault::LossyRetry,
             } => {}
             _ => panic!("Unsupported networking info: {:?}", networking_info),
         }
@@ -112,7 +112,7 @@ impl<'a> Deploy<'a> for HydroDeploy {
     ) -> (syn::Expr, syn::Expr) {
         match networking_info {
             crate::networking::NetworkingInfo::Tcp {
-                fault: crate::networking::TcpFault::FailStop,
+                fault: crate::networking::TcpFault::FailStop | crate::networking::TcpFault::LossyRetry,
             } => {}
             _ => panic!("Unsupported networking info: {:?}", networking_info),
         }
@@ -172,7 +172,7 @@ impl<'a> Deploy<'a> for HydroDeploy {
     ) -> (syn::Expr, syn::Expr) {
         match networking_info {
             crate::networking::NetworkingInfo::Tcp {
-                fault: crate::networking::TcpFault::FailStop,
+                fault: crate::networking::TcpFault::FailStop | crate::networking::TcpFault::LossyRetry,
             } => {}
             _ => panic!("Unsupported networking info: {:?}", networking_info),
         }
@@ -224,7 +224,7 @@ impl<'a> Deploy<'a> for HydroDeploy {
     ) -> (syn::Expr, syn::Expr) {
         match networking_info {
             crate::networking::NetworkingInfo::Tcp {
-                fault: crate::networking::TcpFault::FailStop,
+                fault: crate::networking::TcpFault::FailStop | crate::networking::TcpFault::LossyRetry,
             } => {}
             _ => panic!("Unsupported networking info: {:?}", networking_info),
         }

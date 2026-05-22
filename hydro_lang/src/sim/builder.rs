@@ -194,6 +194,7 @@ impl DfirBuilder for SimBuilder {
                                 format_item_debug: #root::__maybe_debug__!(#element_type),
                                 lossy: false,
                                 is_interval: false,
+                                fair_lossy: false,
                                 _order: std::marker::PhantomData,
                                 last_dropped: None,
                             })
@@ -1193,10 +1194,10 @@ impl DfirBuilder for SimBuilder {
         networking_info: &crate::networking::NetworkingInfo,
     ) {
         use crate::networking::{NetworkingInfo, TcpFault};
-        let is_lossy = match networking_info {
+        let (is_lossy, is_fair_lossy) = match networking_info {
             NetworkingInfo::Tcp { fault } => match fault {
-                TcpFault::FailStop => false,
-                TcpFault::Lossy => true,
+                TcpFault::FailStop => (false, false),
+                TcpFault::Lossy => (true, false),
                 TcpFault::LossyDelayedForever => {
                     assert!(
                         self.test_safety_only,
@@ -1206,14 +1207,15 @@ impl DfirBuilder for SimBuilder {
                          `.sim().test_safety_only()` to opt in."
                     );
                     // LossyDelayedForever uses the same wiring as FailStop (safety-only)
-                    false
+                    (false, false)
                 }
+                TcpFault::LossyRetry => (false, true),
             },
         };
 
         let root = get_this_crate();
 
-        if is_lossy {
+        if is_lossy || is_fair_lossy {
             // For lossy networks, route through a StreamHook that can non-deterministically
             // drop messages. The hook is registered at the receiver's location.
             let hoff_id = self.next_hoff_id;
@@ -1226,7 +1228,7 @@ impl DfirBuilder for SimBuilder {
                 syn::Ident::new(&format!("__lossy_hoff_recv_{hoff_id}"), Span::call_site());
 
             let lossy_location_desc = syn::LitStr::new(
-                &format!("lossy {:?} → {:?}", from, to),
+                &format!("{} {:?} → {:?}", if is_lossy { "lossy" } else { "fair_lossy" }, from, to),
                 Span::call_site(),
             );
 
@@ -1273,8 +1275,9 @@ impl DfirBuilder for SimBuilder {
                                 output: #hoff_send_ident,
                                 batch_location: (#lossy_location_desc, "", ""),
                                 format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
-                                lossy: true,
+                                lossy: #is_lossy,
                                 is_interval: false,
+                                fair_lossy: #is_fair_lossy,
                                 _order: std::marker::PhantomData,
                                 last_dropped: None,
                             })
@@ -1357,8 +1360,9 @@ impl DfirBuilder for SimBuilder {
                                 output: #hoff_send_ident,
                                 batch_location: (#lossy_location_desc, "", ""),
                                 format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
-                                lossy: true,
+                                lossy: #is_lossy,
                                 is_interval: false,
+                                fair_lossy: #is_fair_lossy,
                                 _order: std::marker::PhantomData,
                                 last_dropped: None,
                             })
@@ -1457,8 +1461,9 @@ impl DfirBuilder for SimBuilder {
                                 output: #hoff_send_ident,
                                 batch_location: (#lossy_location_desc, "", ""),
                                 format_item_debug: #root::__maybe_debug__!(__root_dfir_rs::bytes::Bytes),
-                                lossy: true,
+                                lossy: #is_lossy,
                                 is_interval: false,
+                                fair_lossy: #is_fair_lossy,
                                 _order: std::marker::PhantomData,
                                 last_dropped: None,
                             })
@@ -1564,8 +1569,9 @@ impl DfirBuilder for SimBuilder {
                                 output: #hoff_send_ident,
                                 batch_location: (#lossy_location_desc, "", ""),
                                 format_item_debug: #root::__maybe_debug__!((#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)),
-                                lossy: true,
+                                lossy: #is_lossy,
                                 is_interval: false,
+                                fair_lossy: #is_fair_lossy,
                                 _order: std::marker::PhantomData,
                                 last_dropped: None,
                             })

@@ -207,6 +207,7 @@ pub struct StreamHook<T, Order: Ordering> {
     pub format_item_debug: fn(&T) -> Option<String>,
     pub lossy: bool,
     pub is_interval: bool,
+    pub fair_lossy: bool,
     pub _order: std::marker::PhantomData<Order>,
     /// Debug description of the most recently dropped message (lossy mode only).
     pub last_dropped: Option<String>,
@@ -226,7 +227,7 @@ impl<T> SimHook for StreamHook<T, TotalOrder> {
     }
 
     fn is_fairness_subject(&self) -> bool {
-        self.lossy || self.is_interval
+        self.lossy || self.is_interval || self.fair_lossy
     }
 
     fn pending_count(&self) -> usize {
@@ -338,7 +339,7 @@ impl<T> SimHook for StreamHook<T, NoOrder> {
     }
 
     fn is_fairness_subject(&self) -> bool {
-        self.lossy || self.is_interval
+        self.lossy || self.is_interval || self.fair_lossy
     }
 
     fn pending_count(&self) -> usize {

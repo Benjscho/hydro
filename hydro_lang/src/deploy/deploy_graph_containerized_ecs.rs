@@ -458,10 +458,10 @@ impl<'a> Deploy<'a> for EcsDeploy {
         p2_port: &<Self::Process as Node>::Port,
         name: Option<&str>,
         networking_info: &crate::networking::NetworkingInfo,
-    ) -> (syn::Expr, syn::Expr) {
+      ) -> (syn::Expr, syn::Expr) {
         match networking_info {
             crate::networking::NetworkingInfo::Tcp {
-                fault: crate::networking::TcpFault::FailStop,
+                fault: crate::networking::TcpFault::FailStop | crate::networking::TcpFault::LossyRetry,
             } => {}
             _ => panic!("Unsupported networking info: {:?}", networking_info),
         }
@@ -501,7 +501,7 @@ impl<'a> Deploy<'a> for EcsDeploy {
     ) -> (syn::Expr, syn::Expr) {
         match networking_info {
             crate::networking::NetworkingInfo::Tcp {
-                fault: crate::networking::TcpFault::FailStop,
+                fault: crate::networking::TcpFault::FailStop | crate::networking::TcpFault::LossyRetry,
             } => {}
             _ => panic!("Unsupported networking info: {:?}", networking_info),
         }
@@ -540,7 +540,7 @@ impl<'a> Deploy<'a> for EcsDeploy {
     ) -> (syn::Expr, syn::Expr) {
         match networking_info {
             crate::networking::NetworkingInfo::Tcp {
-                fault: crate::networking::TcpFault::FailStop,
+                fault: crate::networking::TcpFault::FailStop | crate::networking::TcpFault::LossyRetry,
             } => {}
             _ => panic!("Unsupported networking info: {:?}", networking_info),
         }
@@ -580,7 +580,7 @@ impl<'a> Deploy<'a> for EcsDeploy {
     ) -> (syn::Expr, syn::Expr) {
         match networking_info {
             crate::networking::NetworkingInfo::Tcp {
-                fault: crate::networking::TcpFault::FailStop,
+                fault: crate::networking::TcpFault::FailStop | crate::networking::TcpFault::LossyRetry,
             } => {}
             _ => panic!("Unsupported networking info: {:?}", networking_info),
         }

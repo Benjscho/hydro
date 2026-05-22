@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::live_collections::stream::networking::{deserialize_bincode, serialize_bincode};
-use crate::live_collections::stream::{NoOrder, TotalOrder};
+use crate::live_collections::stream::{AtLeastOnce, ExactlyOnce, NoOrder, Retries, TotalOrder};
 use crate::nondet::NonDet;
 
 #[sealed::sealed]
@@ -39,6 +39,9 @@ pub trait TransportKind {
     /// The ordering guarantee provided by this transport.
     type OrderingGuarantee: crate::live_collections::stream::Ordering;
 
+    /// The retry guarantee introduced by this transport.
+    type RetryGuarantee: Retries;
+
     /// Returns the [`NetworkingInfo`] describing this transport's configuration.
     fn networking_info() -> NetworkingInfo;
 }
@@ -53,6 +56,11 @@ pub trait TcpFailPolicy {
     /// The ordering guarantee provided by this failure policy.
     type OrderingGuarantee: crate::live_collections::stream::Ordering;
 
+    /// The retry guarantee introduced by this failure policy.
+    /// Most policies preserve the input's retry guarantee (`ExactlyOnce`),
+    /// but `LossyRetry` weakens it to `AtLeastOnce`.
+    type RetryGuarantee: Retries;
+
     /// Returns the [`TcpFault`] variant for this failure policy.
     fn tcp_fault() -> TcpFault;
 }
@@ -62,6 +70,7 @@ pub enum FailStop {}
 #[sealed::sealed]
 impl TcpFailPolicy for FailStop {
     type OrderingGuarantee = TotalOrder;
+    type RetryGuarantee = ExactlyOnce;
 
     fn tcp_fault() -> TcpFault {
         TcpFault::FailStop
@@ -73,6 +82,7 @@ pub enum Lossy {}
 #[sealed::sealed]
 impl TcpFailPolicy for Lossy {
     type OrderingGuarantee = TotalOrder;
+    type RetryGuarantee = ExactlyOnce;
 
     fn tcp_fault() -> TcpFault {
         TcpFault::Lossy
@@ -94,9 +104,33 @@ pub enum LossyDelayedForever {}
 #[sealed::sealed]
 impl TcpFailPolicy for LossyDelayedForever {
     type OrderingGuarantee = NoOrder;
+    type RetryGuarantee = ExactlyOnce;
 
     fn tcp_fault() -> TcpFault {
         TcpFault::LossyDelayedForever
+    }
+}
+
+/// A TCP failure policy that models lossy delivery with automatic retries.
+///
+/// Messages may be lost in transit, but the sender automatically retries,
+/// guaranteeing eventual delivery (at-least-once semantics). The receiver
+/// may observe duplicates and messages may arrive out of order.
+///
+/// This models the common real-world pattern of unreliable networks with
+/// application-level retry logic (gRPC retries, message queues, TCP reconnection).
+///
+/// The output stream has [`NoOrder`] and [`AtLeastOnce`] guarantees, which means
+/// downstream consumers must handle duplicates (e.g., via idempotent operations
+/// like `max`, `min`, or `fold` with an idempotence proof).
+pub enum LossyRetry {}
+#[sealed::sealed]
+impl TcpFailPolicy for LossyRetry {
+    type OrderingGuarantee = NoOrder;
+    type RetryGuarantee = AtLeastOnce;
+
+    fn tcp_fault() -> TcpFault {
+        TcpFault::LossyRetry
     }
 }
 
@@ -108,6 +142,7 @@ pub struct Tcp<F> {
 #[sealed::sealed]
 impl<F: TcpFailPolicy> TransportKind for Tcp<F> {
     type OrderingGuarantee = F::OrderingGuarantee;
+    type RetryGuarantee = F::RetryGuarantee;
 
     fn networking_info() -> NetworkingInfo {
         NetworkingInfo::Tcp {
@@ -123,6 +158,11 @@ pub trait NetworkFor<T: ?Sized> {
     /// When combined with an input stream's ordering `O`, the output ordering
     /// will be `<O as MinOrder<Self::OrderingGuarantee>>::Min`.
     type OrderingGuarantee: crate::live_collections::stream::Ordering;
+
+    /// The retry guarantee introduced by this network configuration.
+    /// When combined with an input stream's retry `R`, the output retry
+    /// will be `<R as MinRetries<Self::RetryGuarantee>>::Min`.
+    type RetryGuarantee: Retries;
 
     /// Generates serialization logic for sending `T`.
     fn serialize_thunk(is_demux: bool) -> syn::Expr;
@@ -146,6 +186,8 @@ pub enum TcpFault {
     Lossy,
     /// Dropped messages are treated as indefinitely delayed with no ordering guarantee.
     LossyDelayedForever,
+    /// Messages may be lost but the sender retries, guaranteeing at-least-once delivery.
+    LossyRetry,
 }
 
 /// Describes the networking configuration for a network channel at the IR level.
@@ -239,6 +281,26 @@ impl<S: ?Sized> NetworkingConfig<Tcp<()>, S> {
             _phantom: (PhantomData, PhantomData),
         }
     }
+
+    /// Configures the TCP transport to model lossy delivery with automatic retries.
+    ///
+    /// Individual messages may be lost, but the sender retries automatically,
+    /// guaranteeing at-least-once delivery. The output stream will have
+    /// [`NoOrder`] ordering and [`AtLeastOnce`] retry semantics.
+    ///
+    /// This is the recommended channel type for protocols that must tolerate
+    /// network partitions and process crashes, such as consensus protocols,
+    /// request-response patterns, and event streaming.
+    ///
+    /// Unlike [`Self::lossy`], this does not require a [`NonDet`] annotation because
+    /// the non-determinism (duplicates, reordering) is fully captured by the output type,
+    /// and the liveness guarantee means no information is lost.
+    pub const fn lossy_retry(self) -> NetworkingConfig<Tcp<LossyRetry>, S> {
+        NetworkingConfig {
+            name: self.name,
+            _phantom: (PhantomData, PhantomData),
+        }
+    }
 }
 
 #[sealed::sealed]
@@ -248,6 +310,7 @@ where
     S: SerKind<T>,
 {
     type OrderingGuarantee = Tr::OrderingGuarantee;
+    type RetryGuarantee = Tr::RetryGuarantee;
 
     fn serialize_thunk(is_demux: bool) -> syn::Expr {
         S::serialize_thunk(is_demux)
@@ -273,6 +336,7 @@ where
     S: SerKind<T>,
 {
     type OrderingGuarantee = Tr::OrderingGuarantee;
+    type RetryGuarantee = Tr::RetryGuarantee;
 
     fn serialize_thunk(is_demux: bool) -> syn::Expr {
         S::serialize_thunk(is_demux)

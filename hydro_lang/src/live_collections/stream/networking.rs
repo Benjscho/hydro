@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use stageleft::{q, quote_type};
 use syn::parse_quote;
 
-use super::{ExactlyOnce, MinOrder, Ordering, Stream, TotalOrder};
+use super::{ExactlyOnce, MinOrder, MinRetries, Ordering, Stream, TotalOrder};
 use crate::compile::ir::{DebugInstantiate, HydroIrOpMetadata, HydroNode, HydroRoot};
 use crate::live_collections::boundedness::{Boundedness, Unbounded};
 use crate::live_collections::keyed_singleton::KeyedSingleton;
@@ -162,10 +162,17 @@ impl<'a, T, L, B: Boundedness, O: Ordering, R: Retries> Stream<T, Process<'a, L>
         self,
         to: &Process<'a, L2>,
         via: N,
-    ) -> Stream<T, Process<'a, L2>, Unbounded, <O as MinOrder<N::OrderingGuarantee>>::Min, R>
+    ) -> Stream<
+        T,
+        Process<'a, L2>,
+        Unbounded,
+        <O as MinOrder<N::OrderingGuarantee>>::Min,
+        <R as MinRetries<N::RetryGuarantee>>::Min,
+    >
     where
         T: Serialize + DeserializeOwned,
         O: MinOrder<N::OrderingGuarantee>,
+        R: MinRetries<N::RetryGuarantee>,
     {
         let serialize_pipeline = Some(N::serialize_thunk(false));
         let deserialize_pipeline = Some(N::deserialize_thunk(None));
@@ -191,7 +198,7 @@ impl<'a, T, L, B: Boundedness, O: Ordering, R: Retries> Stream<T, Process<'a, L>
                     Process<'a, L2>,
                     Unbounded,
                     <O as MinOrder<N::OrderingGuarantee>>::Min,
-                    R,
+                    <R as MinRetries<N::RetryGuarantee>>::Min,
                 >::collection_kind()),
             },
         )
@@ -294,10 +301,17 @@ impl<'a, T, L, B: Boundedness, O: Ordering, R: Retries> Stream<T, Process<'a, L>
         to: &Cluster<'a, L2>,
         via: N,
         nondet_membership: NonDet,
-    ) -> Stream<T, Cluster<'a, L2>, Unbounded, <O as MinOrder<N::OrderingGuarantee>>::Min, R>
+    ) -> Stream<
+        T,
+        Cluster<'a, L2>,
+        Unbounded,
+        <O as MinOrder<N::OrderingGuarantee>>::Min,
+        <R as MinRetries<N::RetryGuarantee>>::Min,
+    >
     where
         T: Clone + Serialize + DeserializeOwned,
         O: MinOrder<N::OrderingGuarantee>,
+        R: MinRetries<N::RetryGuarantee>,
     {
         let ids = track_membership(self.location.source_cluster_members(to));
         sliced! {
@@ -351,10 +365,17 @@ impl<'a, T, L, B: Boundedness, O: Ordering, R: Retries> Stream<T, Process<'a, L>
         self,
         to: &Cluster<'a, L2>,
         via: N,
-    ) -> Stream<T, Cluster<'a, L2>, Unbounded, <O as MinOrder<N::OrderingGuarantee>>::Min, R>
+    ) -> Stream<
+        T,
+        Cluster<'a, L2>,
+        Unbounded,
+        <O as MinOrder<N::OrderingGuarantee>>::Min,
+        <R as MinRetries<N::RetryGuarantee>>::Min,
+    >
     where
         T: Clone + Serialize + DeserializeOwned,
         O: MinOrder<N::OrderingGuarantee>,
+        R: MinRetries<N::RetryGuarantee>,
     {
         let cluster_ids = ClusterIds {
             key: to.key,
@@ -563,10 +584,17 @@ impl<'a, T, L, L2, B: Boundedness, O: Ordering, R: Retries>
         self,
         to: &Cluster<'a, L2>,
         via: N,
-    ) -> Stream<T, Cluster<'a, L2>, Unbounded, <O as MinOrder<N::OrderingGuarantee>>::Min, R>
+    ) -> Stream<
+        T,
+        Cluster<'a, L2>,
+        Unbounded,
+        <O as MinOrder<N::OrderingGuarantee>>::Min,
+        <R as MinRetries<N::RetryGuarantee>>::Min,
+    >
     where
         T: Serialize + DeserializeOwned,
         O: MinOrder<N::OrderingGuarantee>,
+        R: MinRetries<N::RetryGuarantee>,
     {
         self.into_keyed().demux(to, via)
     }
@@ -675,7 +703,7 @@ impl<'a, T, L, B: Boundedness> Stream<T, Process<'a, L>, B, TotalOrder, ExactlyO
     /// # }));
     /// # }
     /// ```
-    pub fn round_robin<L2: 'a, N: NetworkFor<T>>(
+    pub fn round_robin<L2: 'a, N: NetworkFor<T, RetryGuarantee = ExactlyOnce>>(
         self,
         to: &Cluster<'a, L2>,
         via: N,
@@ -818,7 +846,7 @@ impl<'a, T, L, B: Boundedness> Stream<T, Cluster<'a, L>, B, TotalOrder, ExactlyO
     /// # }));
     /// # }
     /// ```
-    pub fn round_robin<L2: 'a, N: NetworkFor<T>>(
+    pub fn round_robin<L2: 'a, N: NetworkFor<T, RetryGuarantee = ExactlyOnce>>(
         self,
         to: &Cluster<'a, L2>,
         via: N,
@@ -982,11 +1010,12 @@ impl<'a, T, L, B: Boundedness, O: Ordering, R: Retries> Stream<T, Cluster<'a, L>
         Process<'a, L2>,
         Unbounded,
         <O as MinOrder<N::OrderingGuarantee>>::Min,
-        R,
+        <R as MinRetries<N::RetryGuarantee>>::Min,
     >
     where
         T: Serialize + DeserializeOwned,
         O: MinOrder<N::OrderingGuarantee>,
+        R: MinRetries<N::RetryGuarantee>,
     {
         let serialize_pipeline = Some(N::serialize_thunk(false));
 
@@ -1004,7 +1033,7 @@ impl<'a, T, L, B: Boundedness, O: Ordering, R: Retries> Stream<T, Cluster<'a, L>
             Process<'a, L2>,
             Unbounded,
             <O as MinOrder<N::OrderingGuarantee>>::Min,
-            R,
+            <R as MinRetries<N::RetryGuarantee>>::Min,
         > = Stream::new(
             to.clone(),
             HydroNode::Network {
@@ -1019,7 +1048,7 @@ impl<'a, T, L, B: Boundedness, O: Ordering, R: Retries> Stream<T, Cluster<'a, L>
                     Process<'a, L2>,
                     Unbounded,
                     <O as MinOrder<N::OrderingGuarantee>>::Min,
-                    R,
+                    <R as MinRetries<N::RetryGuarantee>>::Min,
                 >::collection_kind()),
             },
         );
@@ -1145,11 +1174,12 @@ impl<'a, T, L, B: Boundedness, O: Ordering, R: Retries> Stream<T, Cluster<'a, L>
         Cluster<'a, L2>,
         Unbounded,
         <O as MinOrder<N::OrderingGuarantee>>::Min,
-        R,
+        <R as MinRetries<N::RetryGuarantee>>::Min,
     >
     where
         T: Clone + Serialize + DeserializeOwned,
         O: MinOrder<N::OrderingGuarantee>,
+        R: MinRetries<N::RetryGuarantee>,
     {
         let ids = track_membership(self.location.source_cluster_members(to));
         sliced! {
@@ -1327,11 +1357,12 @@ impl<'a, T, L, L2, B: Boundedness, O: Ordering, R: Retries>
         Cluster<'a, L2>,
         Unbounded,
         <O as MinOrder<N::OrderingGuarantee>>::Min,
-        R,
+        <R as MinRetries<N::RetryGuarantee>>::Min,
     >
     where
         T: Serialize + DeserializeOwned,
         O: MinOrder<N::OrderingGuarantee>,
+        R: MinRetries<N::RetryGuarantee>,
     {
         self.into_keyed().demux(to, via)
     }

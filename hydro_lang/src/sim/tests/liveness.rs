@@ -124,3 +124,30 @@ fn liveness_retry_with_ack() {
         out.assert_yields([42_u32]).await;
     });
 }
+
+/// Example 4: Single send over lossy_retry — should PASS.
+///
+/// Unlike `lossy()`, `lossy_retry()` guarantees eventual delivery via fairness.
+/// A single message sent over `lossy_retry()` will eventually arrive because
+/// the channel itself models retry semantics.
+#[cfg(feature = "sim")]
+#[test]
+fn liveness_single_send_over_lossy_retry() {
+    let mut flow = FlowBuilder::new();
+    let sender_loc = flow.process::<()>();
+    let receiver_loc = flow.process::<()>();
+
+    let data = sender_loc.source_iter(q!(vec![123_u32]));
+
+    // Send over lossy_retry — the channel guarantees eventual delivery.
+    let received = data.send(&receiver_loc, TCP.lossy_retry().bincode());
+
+    // The output has AtLeastOnce and NoOrder semantics.
+    // Use unique() to deduplicate, then sim_output.
+    let out = received.unique().sim_output();
+
+    // Should PASS: lossy_retry guarantees delivery via fairness.
+    flow.sim().max_lasso_steps(5).exhaustive(async || {
+        out.assert_yields_unordered([123_u32]).await;
+    });
+}

@@ -7,7 +7,7 @@ use stageleft::{q, quote_type};
 use super::KeyedStream;
 use crate::compile::ir::{DebugInstantiate, HydroNode};
 use crate::live_collections::boundedness::{Boundedness, Unbounded};
-use crate::live_collections::stream::{MinOrder, Ordering, Retries, Stream};
+use crate::live_collections::stream::{MinOrder, MinRetries, Ordering, Retries, Stream};
 #[cfg(stageleft_runtime)]
 use crate::location::dynamic::DynLocation;
 use crate::location::{Cluster, MemberId, Process};
@@ -106,10 +106,17 @@ impl<'a, T, L, L2, B: Boundedness, O: Ordering, R: Retries>
         self,
         to: &Cluster<'a, L2>,
         via: N,
-    ) -> Stream<T, Cluster<'a, L2>, Unbounded, <O as MinOrder<N::OrderingGuarantee>>::Min, R>
+    ) -> Stream<
+        T,
+        Cluster<'a, L2>,
+        Unbounded,
+        <O as MinOrder<N::OrderingGuarantee>>::Min,
+        <R as MinRetries<N::RetryGuarantee>>::Min,
+    >
     where
         T: Serialize + DeserializeOwned,
         O: MinOrder<N::OrderingGuarantee>,
+        R: MinRetries<N::RetryGuarantee>,
     {
         let serialize_pipeline = Some(N::serialize_thunk(true));
 
@@ -136,7 +143,7 @@ impl<'a, T, L, L2, B: Boundedness, O: Ordering, R: Retries>
                     Cluster<'a, L2>,
                     Unbounded,
                     <O as MinOrder<N::OrderingGuarantee>>::Min,
-                    R,
+                    <R as MinRetries<N::RetryGuarantee>>::Min,
                 >::collection_kind()),
             },
         )
@@ -229,11 +236,12 @@ impl<'a, K, T, L, L2, B: Boundedness, O: Ordering, R: Retries>
         self,
         to: &Cluster<'a, L2>,
         via: N,
-    ) -> KeyedStream<K, T, Cluster<'a, L2>, Unbounded, <O as MinOrder<N::OrderingGuarantee>>::Min, R>
+    ) -> KeyedStream<K, T, Cluster<'a, L2>, Unbounded, <O as MinOrder<N::OrderingGuarantee>>::Min, <R as MinRetries<N::RetryGuarantee>>::Min>
     where
         K: Serialize + DeserializeOwned,
         T: Serialize + DeserializeOwned,
         O: MinOrder<N::OrderingGuarantee>,
+        R: MinRetries<N::RetryGuarantee>,
     {
         let serialize_pipeline = Some(N::serialize_thunk(true));
 
@@ -266,7 +274,7 @@ impl<'a, K, T, L, L2, B: Boundedness, O: Ordering, R: Retries>
                     Cluster<'a, L2>,
                     Unbounded,
                     <O as MinOrder<N::OrderingGuarantee>>::Min,
-                    R,
+                    <R as MinRetries<N::RetryGuarantee>>::Min,
                 >::collection_kind()),
             },
         )
@@ -392,11 +400,12 @@ impl<'a, T, L, L2, B: Boundedness, O: Ordering, R: Retries>
         Cluster<'a, L2>,
         Unbounded,
         <O as MinOrder<N::OrderingGuarantee>>::Min,
-        R,
+        <R as MinRetries<N::RetryGuarantee>>::Min,
     >
     where
         T: Serialize + DeserializeOwned,
         O: MinOrder<N::OrderingGuarantee>,
+        R: MinRetries<N::RetryGuarantee>,
     {
         let serialize_pipeline = Some(N::serialize_thunk(true));
 
@@ -424,7 +433,7 @@ impl<'a, T, L, L2, B: Boundedness, O: Ordering, R: Retries>
                     Cluster<'a, L2>,
                     Unbounded,
                     <O as MinOrder<N::OrderingGuarantee>>::Min,
-                    R,
+                    <R as MinRetries<N::RetryGuarantee>>::Min,
                 >::collection_kind()),
             },
         )
@@ -566,12 +575,13 @@ impl<'a, K, V, L, B: Boundedness, O: Ordering, R: Retries>
         Process<'a, L2>,
         Unbounded,
         <O as MinOrder<N::OrderingGuarantee>>::Min,
-        R,
+        <R as MinRetries<N::RetryGuarantee>>::Min,
     >
     where
         K: Serialize + DeserializeOwned,
         V: Serialize + DeserializeOwned,
         O: MinOrder<N::OrderingGuarantee>,
+        R: MinRetries<N::RetryGuarantee>,
     {
         let serialize_pipeline = Some(N::serialize_thunk(false));
 
@@ -589,7 +599,7 @@ impl<'a, K, V, L, B: Boundedness, O: Ordering, R: Retries>
             Process<'a, L2>,
             Unbounded,
             <O as MinOrder<N::OrderingGuarantee>>::Min,
-            R,
+            <R as MinRetries<N::RetryGuarantee>>::Min,
         > = Stream::new(
             to.clone(),
             HydroNode::Network {
@@ -604,7 +614,7 @@ impl<'a, K, V, L, B: Boundedness, O: Ordering, R: Retries>
                     Cluster<'a, L2>,
                     Unbounded,
                     <O as MinOrder<N::OrderingGuarantee>>::Min,
-                    R,
+                    <R as MinRetries<N::RetryGuarantee>>::Min,
                 >::collection_kind()),
             },
         );

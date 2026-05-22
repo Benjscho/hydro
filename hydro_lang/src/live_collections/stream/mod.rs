@@ -3764,8 +3764,8 @@ mod tests {
         let node = flow.process::<()>();
         let node2 = flow.process::<()>();
 
-        let (in_send, input) = node.sim_input::<_, NoOrder, _>();
-        let (_, input2) = node.sim_input::<_, NoOrder, _>();
+        let (in_send, input) = node.sim_input::<_, NoOrder, ExactlyOnce>();
+        let (_, input2) = node.sim_input::<_, NoOrder, ExactlyOnce>();
 
         let (complete_cycle_back, cycle_back) =
             node.forward_ref::<super::Stream<_, _, _, NoOrder>>();
