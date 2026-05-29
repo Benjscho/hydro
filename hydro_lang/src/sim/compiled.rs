@@ -54,8 +54,7 @@ impl StateFingerprint {
                     // Use "empty vs non-empty" rather than exact count to detect
                     // cycles faster. From a fairness perspective, having 1 vs N
                     // pending messages is the same abstract state (the hook is
-                    // enabled and can deliver). This prevents unbounded state
-                    // growth when messages accumulate in lossy buffers.
+                    // enabled and can deliver).
                     (loc, cid, i, hook.pending_count().min(1)).hash(&mut pending_hasher);
                     (loc, cid, i, hook.can_make_nontrivial_decision()).hash(&mut enabled_hasher);
                 }
@@ -71,7 +70,7 @@ impl StateFingerprint {
 
 /// Tracks which fairness-subject hooks have delivered at least one item during a cycle.
 struct FairnessRecord {
-    /// For each fairness-subject hook, whether it delivered ≥1 item.
+    /// For each fairness-subject hook, whether it delivered ≥1 item naturally (not forced).
     delivered: HashMap<(LocationId, Option<u32>, usize), bool>,
     /// For each fairness-subject hook, whether it was enabled (had pending items) at this step.
     enabled: HashMap<(LocationId, Option<u32>, usize), bool>,
@@ -86,6 +85,9 @@ struct LassoDetector {
     seen: HashMap<StateFingerprint, Vec<usize>>,
     /// Maximum steps before truncation.
     max_steps: usize,
+    /// Whether we've already forced delivery after detecting a fair cycle.
+    /// If true and we detect another fair cycle, it's a genuine LivenessViolation.
+    forced_after_fair: bool,
 }
 
 enum LassoResult {
@@ -105,6 +107,7 @@ impl LassoDetector {
             trace: Vec::new(),
             seen: HashMap::new(),
             max_steps,
+            forced_after_fair: false,
         }
     }
 
@@ -157,8 +160,17 @@ impl LassoDetector {
             });
 
             if all_fair {
-                // Fair lasso — liveness violation
-                return LassoResult::LivenessViolation;
+                // Fair lasso — all enabled hooks delivered at least once in the cycle.
+                if self.forced_after_fair {
+                    // We already forced delivery after a previous fair cycle detection
+                    // and the system still cycled back. Genuine liveness violation.
+                    return LassoResult::LivenessViolation;
+                }
+                // First fair cycle detection: force all enabled hooks to deliver.
+                // This gives the system one more chance to make progress.
+                self.forced_after_fair = true;
+                let all_enabled: Vec<_> = hooks_needing_delivery;
+                return LassoResult::ForceDelivery(all_enabled);
             } else {
                 // Unfair lasso — find starved hooks that were enabled
                 let starved: Vec<_> = hooks_needing_delivery
@@ -169,6 +181,7 @@ impl LassoDetector {
                             .any(|(_, fr)| fr.delivered.get(key).copied() == Some(true))
                     })
                     .collect();
+
                 return LassoResult::ForceDelivery(starved);
             }
         }
@@ -1549,13 +1562,11 @@ impl<W: std::io::Write> LaunchedSim<W> {
                                 .get_mut(&obs_key)
                                 .unwrap_or(&mut default_hooks);
 
-                            run_hooks_with_force(&mut self.log, hooks, &force_indices);
+                            let delivered = run_hooks_with_force(&mut self.log, hooks, &force_indices);
 
                             // Record deliveries from fairness-subject hooks
-                            for (i, hook) in hooks.iter().enumerate() {
-                                if hook.is_fairness_subject() && hook.current_decision() == Some(true) {
-                                    lasso_detector.record_delivery(&obs_key.0, obs_key.1, i);
-                                }
+                            for i in delivered {
+                                lasso_detector.record_delivery(&obs_key.0, obs_key.1, i);
                             }
 
                             // Clear force targets that were just applied
@@ -1563,9 +1574,6 @@ impl<W: std::io::Write> LaunchedSim<W> {
                                 !(*loc == obs_key.0 && *cid == obs_key.1)
                             });
 
-                            // Don't reset lasso detector — if the system cycles again,
-                            // the lasso will detect it as a fair lasso (all hooks delivered)
-                            // and declare quiescence, allowing the test to check assertions.
                             continue; // Go back to run async DFIRs
                         }
 
@@ -1626,13 +1634,11 @@ impl<W: std::io::Write> LaunchedSim<W> {
                                 });
 
                             let hooks = self.hooks.get_mut(&tick_key).unwrap();
-                            run_hooks_with_force(&mut tick_decision_writer, hooks, &tick_force_indices);
+                            let delivered = run_hooks_with_force(&mut tick_decision_writer, hooks, &tick_force_indices);
 
                             // Record deliveries
-                            for (i, hook) in hooks.iter().enumerate() {
-                                if hook.is_fairness_subject() && hook.current_decision() == Some(true) {
-                                    lasso_detector.record_delivery(&removed.0, removed.1, i);
-                                }
+                            for i in delivered {
+                                lasso_detector.record_delivery(&removed.0, removed.1, i);
                             }
 
                             let run_tick_future = removed.2.run_tick();
@@ -1694,13 +1700,11 @@ impl<W: std::io::Write> LaunchedSim<W> {
                                 .map(|(i, _)| i)
                                 .collect();
 
-                            run_hooks_with_force(&mut self.log, hooks, &obs_force_indices);
+                            let delivered = run_hooks_with_force(&mut self.log, hooks, &obs_force_indices);
 
                             // Record deliveries
-                            for (i, hook) in hooks.iter().enumerate() {
-                                if hook.is_fairness_subject() && hook.current_decision() == Some(true) {
-                                    lasso_detector.record_delivery(&obs_key.0, obs_key.1, i);
-                                }
+                            for i in delivered {
+                                lasso_detector.record_delivery(&obs_key.0, obs_key.1, i);
                             }
 
                             continue; // Go back to run async DFIRs to propagate data
@@ -1765,13 +1769,11 @@ impl<W: std::io::Write> LaunchedSim<W> {
                             });
 
                         let hooks = self.hooks.get_mut(&(removed.0.clone(), removed.1)).unwrap();
-                        run_hooks_with_force(&mut tick_decision_writer, hooks, &tick_force_indices);
+                        let delivered = run_hooks_with_force(&mut tick_decision_writer, hooks, &tick_force_indices);
 
                         // Record deliveries from fairness-subject hooks for fairness tracking
-                        for (i, hook) in hooks.iter().enumerate() {
-                            if hook.is_fairness_subject() && hook.current_decision() == Some(true) {
-                                lasso_detector.record_delivery(&removed.0, removed.1, i);
-                            }
+                        for i in delivered {
+                            lasso_detector.record_delivery(&removed.0, removed.1, i);
                         }
 
                         // Clear force targets that were just applied
@@ -1829,13 +1831,11 @@ impl<W: std::io::Write> LaunchedSim<W> {
                             .get_mut(&obs_key)
                             .unwrap_or(&mut default_hooks);
 
-                        run_hooks_with_force(&mut self.log, hooks, &force_indices);
+                        let delivered = run_hooks_with_force(&mut self.log, hooks, &force_indices);
 
                         // Record deliveries from fairness-subject hooks for fairness tracking
-                        for (i, hook) in hooks.iter().enumerate() {
-                            if hook.is_fairness_subject() && hook.current_decision() == Some(true) {
-                                lasso_detector.record_delivery(&obs_key.0, obs_key.1, i);
-                            }
+                        for i in delivered {
+                            lasso_detector.record_delivery(&obs_key.0, obs_key.1, i);
                         }
 
                         // Clear force targets that were just applied
@@ -1852,12 +1852,15 @@ impl<W: std::io::Write> LaunchedSim<W> {
 /// Run hooks, optionally forcing specific hook indices to deliver.
 /// Lossy hooks are exempt from the default "must make at least one nontrivial decision"
 /// constraint unless they appear in `force_indices`.
+///
+/// Returns the set of fairness-subject hook indices that delivered (made a nontrivial decision).
 fn run_hooks_with_force(
     tick_decision_writer: &mut impl std::fmt::Write,
     hooks: &mut Vec<Box<dyn SimHook>>,
     force_indices: &[usize],
-) {
+) -> Vec<usize> {
     let mut made_nontrivial_decision = false;
+    let mut delivered_indices = Vec::new();
 
     // Pre-compute which hooks are fairness-subject and which can make nontrivial decisions
     let hook_is_fairness_subject: Vec<bool> = hooks.iter().map(|h| h.is_fairness_subject()).collect();
@@ -1899,7 +1902,14 @@ fn run_hooks_with_force(
                 made_nontrivial_decision |= hook.autonomous_decision(driver, force);
             }
 
+            // Record which fairness-subject hooks delivered before release clears the state
+            if hook_is_fairness_subject[idx] && hook.current_decision() == Some(true) {
+                delivered_indices.push(idx);
+            }
+
             hook.release_decision(tick_decision_writer);
         });
     });
+
+    delivered_indices
 }

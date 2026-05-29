@@ -213,3 +213,72 @@ fn lossy_retry_idempotent_fold_correct() {
         out.assert_yields_unordered([10_u32, 20_u32, 30_u32]).await;
     });
 }
+
+/// Example 7: merge_unordered over lossy — repeated stream value eventually arrives.
+///
+/// A source_iter(123) is sampled every second (producing an unbounded stream of 123),
+/// and a source_iter(456) is sent once. After merge_unordered and sending over lossy,
+/// 123 should eventually arrive because sample_every keeps retrying, but 456 (sent
+/// only once) may be dropped permanently.
+#[cfg(feature = "sim")]
+#[test]
+fn liveness_merge_unordered_interval_arrives() {
+    let mut flow = FlowBuilder::new();
+    let sender_loc = flow.process::<()>();
+    let receiver_loc = flow.process::<()>();
+
+    // Repeatedly produce 123 via sample_every (unbounded stream).
+    let repeated_123 = sender_loc
+        .source_iter(q!(vec![123_u32]))
+        .fold(q!(|| 0u32), q!(|acc, v| *acc = v))
+        .sample_every(q!(Duration::from_secs(1)), nondet!(/** interval */));
+
+    // Produce 456 exactly once (bounded, converted to unbounded for merge).
+    let once_456 = sender_loc.source_iter(q!(vec![456_u32]));
+
+    // Merge and send over lossy.
+    let merged = repeated_123.merge_unordered(once_456.into());
+    let received = merged.send(&receiver_loc, TCP.lossy(nondet!(/** lossy */)).bincode());
+
+    // unique() deduplicates AtLeastOnce → ExactlyOnce, enabling assert_yields_unordered.
+    let only_123 = received.filter(q!(|v| *v == 123)).unique();
+    let out = only_123.sim_output();
+
+    // 123 should eventually arrive because sample_every keeps producing it.
+    flow.sim().max_lasso_steps(5).exhaustive(async || {
+        out.assert_yields_unordered([123_u32]).await;
+    });
+}
+
+/// Example 8: merge_unordered over lossy — source_iter value never guaranteed.
+///
+/// Same setup as above, but asserting that 456 arrives. Since 456 is only sent
+/// once (via source_iter) and there's no retry, the lossy channel can drop it.
+/// The simulator should detect this as a liveness violation.
+#[cfg(feature = "sim")]
+#[test]
+#[should_panic(expected = "liveness violation")]
+fn liveness_merge_unordered_iter_never_arrives() {
+    let mut flow = FlowBuilder::new();
+    let sender_loc = flow.process::<()>();
+    let receiver_loc = flow.process::<()>();
+
+    let repeated_123 = sender_loc
+        .source_iter(q!(vec![123_u32]))
+        .fold(q!(|| 0u32), q!(|acc, v| *acc = v))
+        .sample_every(q!(Duration::from_secs(1)), nondet!(/** interval */));
+
+    let once_456 = sender_loc.source_iter(q!(vec![456_u32]));
+
+    let merged = repeated_123.merge_unordered(once_456.into());
+    let received = merged.send(&receiver_loc, TCP.lossy(nondet!(/** lossy */)).bincode());
+
+    // Filter to only 456 values, unique() for ExactlyOnce.
+    let only_456 = received.filter(q!(|v| *v == 456)).unique();
+    let out = only_456.sim_output();
+
+    // This should FAIL: 456 is sent once, lossy can drop it, no retry.
+    flow.sim().max_lasso_steps(5).exhaustive(async || {
+        out.assert_yields_unordered([456_u32]).await;
+    });
+}
